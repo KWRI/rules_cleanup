@@ -3,7 +3,7 @@ Pipeline Stage 7: Bulk Production Promotion Engine.
 
 Promotes newly standardized rules, schema maps, and metadata to the Production environment:
 1. Reads active target numeric MLS IDs directly from 'temp-data/promotion_sources.txt'
-   (or automatically builds it from Stage 0/4 targets if missing).
+   (or automatically builds it from Stage 4 targets if missing).
 2. Stages the manifest file on the remote deployment server over SFTP.
 3. Invokes an interactive SSH shell to execute remote promotion commands ('s_p',
    'set_promotion stage prod', and 'promote_source.py').
@@ -16,17 +16,58 @@ import sys
 import io
 import csv
 import time
+import signal
+import logging
+import warnings
 import paramiko
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import serialization
 
-from rules_utils import load_target_mls
-from pipeline_logger import setup_logger
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig=None, frame=None):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+warnings.filterwarnings("ignore")
+
+if not hasattr(paramiko, 'DSSKey'):
+    paramiko.DSSKey = paramiko.PKey
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
-logger = setup_logger("Stage7_BulkPromotion")
+load_dotenv(dotenv_path=current_dir / ".env")
+
+
+def setup_logger():
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = log_dir / f"pipeline_{today_str}.log"
+
+    logger = logging.getLogger("Stage7_BulkPromotion")
+    logger.setLevel(logging.INFO)
+    if not logger.hasHandlers():
+        formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+        c_handler = logging.StreamHandler(sys.stdout)
+        c_handler.setFormatter(formatter)
+        logger.addHandler(c_handler)
+
+        f_handler = logging.FileHandler(log_file, encoding="utf-8")
+        f_handler.setFormatter(formatter)
+        logger.addHandler(f_handler)
+
+    return logger
+
+
+logger = setup_logger()
 
 # ============================================================
 # SSH ENVIRONMENT CONSTANTS
@@ -44,7 +85,7 @@ REMOTE_MANIFEST_PATH = os.getenv(
 def ensure_promotion_manifest(temp_data_dir: Path) -> Path:
     """
     Ensures promotion_sources.txt exists and contains target MLS IDs.
-    If missing or empty, builds it automatically from raw_targeted_rules.csv or Stage 0 manifests.
+    If missing or empty, builds it automatically from raw_targeted_rules.csv or batch_mls_targets.csv.
     """
     manifest_path = temp_data_dir / "promotion_sources.txt"
     target_ids = set()
@@ -67,9 +108,16 @@ def ensure_promotion_manifest(temp_data_dir: Path) -> Path:
                     if mls_id.isdigit():
                         target_ids.add(int(mls_id))
 
-    # 3. Fallback: Parse Stage 0 text targets (api_mls.txt, rets_mls.txt)
+    # 3. Fallback: Parse batch_mls_targets.csv
     if not target_ids:
-        target_ids = load_target_mls(temp_data_dir)
+        batch_csv = temp_data_dir / "batch_mls_targets.csv"
+        if batch_csv.exists():
+            with open(batch_csv, mode="r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    mls_id = row.get("mls_id", "").strip()
+                    if mls_id.isdigit():
+                        target_ids.add(int(mls_id))
 
     # Output verified sorted manifest
     if target_ids:
@@ -104,10 +152,6 @@ def get_target_mls_ids(manifest_path: Path) -> list[int]:
     return unique_ids
 
 
-# ============================================================
-# PROMOTION ENGINE
-# ============================================================
-
 def main() -> None:
     logger.info("============================================================")
     logger.info("🚀 STAGE 7: PRODUCTION PROMOTION ENGINE INITIALIZED")
@@ -132,7 +176,7 @@ def main() -> None:
     logger.info(f"[1/4] Connecting to remote host {SSH_HOST}...")
 
     if not SSH_KEY_PATH:
-        logger.error("❌ SSH key path missing from configuration! Check REMOTE_SSH_KEY_PATH or SSH_KEY_PATH in ..env.")
+        logger.error("❌ SSH key path missing from configuration! Check SSH_KEY_PATH in .env.")
         sys.exit(1)
 
     try:
@@ -224,4 +268,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        force_terminal_exit()

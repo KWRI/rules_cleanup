@@ -1,61 +1,84 @@
 """
 Pipeline Stage 4: Architectural Property Configuration Extraction Engine.
 
-This script ingests the local 'temp-data/migration_blueprint.csv' map and
-streams live vendor property definitions from the database. It recursively traverses deeply nested
-JSON property and mapping schema trees to target active rule mutations. It then writes a
-comprehensive database layout configuration map to 'temp-data/raw_targeted_rules.csv' and aggregates
-a numerically sorted, unique integer list of affected IDs to 'temp-data/promotion_sources.txt'.
+Ingests 'temp-data/consolidation_blueprint.csv', streams active process map JSON schemas
+from the Staging database over SSH, recursively replaces legacy rule functions with standardized
+generic targets, and writes:
+  1. 'temp-data/raw_targeted_rules.csv' (Bulk UI Map update payload)
+  2. 'temp-data/promotion_sources.txt' (Numerically sorted affected MLS IDs)
 
-Supports target MLS batch mode via 'temp-data/api_mls.txt' and/or 'temp-data/rets_mls.txt'
-(via rules_utils.py).
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
 import io
+import sys
 import json
 import csv
 import time
+import signal
+import logging
 import warnings
 from pathlib import Path
+from datetime import datetime
+
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig=None, frame=None):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+warnings.filterwarnings("ignore")
+
 import psycopg2
 import paramiko
 from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
-from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 
-from rules_utils import load_target_mls, load_processed_ledger
-from pipeline_logger import setup_logger
-
-warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
-warnings.filterwarnings("ignore", message=".*TripleDES.*")
-
-current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
-logger = setup_logger("Stage4_ExtractCSV")
+if not hasattr(paramiko, 'DSSKey'):
+    paramiko.DSSKey = paramiko.PKey
 
 
-def update_ledger_directly(temp_data_dir: Path, no_op_mls_ids: set[int]) -> None:
-    """Writes no-op (already standardized) MLS IDs directly into processed_mls_ledger.json."""
-    if not no_op_mls_ids:
-        return
+def setup_logger():
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = log_dir / f"pipeline_{today_str}.log"
 
-    ledger_file = temp_data_dir / "processed_mls_ledger.json"
-    completed_mls = load_processed_ledger(temp_data_dir)
+    logger = logging.getLogger("Stage4_ExtractCSV")
+    logger.setLevel(logging.INFO)
+    if not logger.hasHandlers():
+        formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    completed_mls.update(no_op_mls_ids)
-    ledger_file.parent.mkdir(parents=True, exist_ok=True)
-    ledger_file.write_text(
-        json.dumps({"completed_mls_ids": sorted(list(completed_mls))}, indent=2),
-        encoding="utf-8"
+        c_handler = logging.StreamHandler(sys.stdout)
+        c_handler.setFormatter(formatter)
+        logger.addHandler(c_handler)
+
+        f_handler = logging.FileHandler(log_file, encoding="utf-8")
+        f_handler.setFormatter(formatter)
+        logger.addHandler(f_handler)
+
+    return logger
+
+
+def load_ssh_pkey(key_path: str, passphrase: str):
+    with open(key_path, "rb") as key_file:
+        private_key = serialization.load_pem_private_key(
+            key_file.read(),
+            password=passphrase.encode() if passphrase else None,
+        )
+    pem_data = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
     )
-
-    logger.info(
-        f"✅ [DIRECT LEDGER UPDATE] Recorded {len(no_op_mls_ids)} no-op MLS ID(s) "
-        f"({', '.join(str(m) for m in sorted(list(no_op_mls_ids)))}) directly into '{ledger_file.name}'."
-    )
+    return paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
 
 
 def extract_rules_recursive(schema_node, target_rules_set, current_path=""):
@@ -104,33 +127,20 @@ def extract_rules_recursive(schema_node, target_rules_set, current_path=""):
 
 
 def run_production_extractor():
-    repo_base_raw = os.getenv("REPO_PATH", "") or os.getenv("UI_RULES_DIR", "")
-    repo_path = repo_base_raw.strip().strip("'\"")
-    if not repo_path:
-        repo_path = str(current_dir.parent / "dm-consolidated-rules")
+    logger = setup_logger()
+    logger.info("--- Starting Stage 4: Architectural Property Extraction Engine ---")
 
-    ui_rules_root = Path(repo_path) / "ui-rules"
-    if not ui_rules_root.exists() and (Path(repo_path) / "active").exists():
-        active_rules_dir = Path(repo_path) / "active"
-    else:
-        active_rules_dir = ui_rules_root / "active"
-
-    temp_data_dir = current_dir / "temp-data"
+    temp_data_dir = Path("temp-data")
     temp_data_dir.mkdir(parents=True, exist_ok=True)
 
-    blueprint_path = temp_data_dir / "migration_blueprint.csv"
+    blueprint_path = temp_data_dir / "consolidation_blueprint.csv"
     output_csv_path = temp_data_dir / "raw_targeted_rules.csv"
     txt_output_path = temp_data_dir / "promotion_sources.txt"
 
     if not blueprint_path.exists():
-        logger.error("Stage 2 assets missing. Please execute Stage 2 standardization first.")
+        logger.error(
+            "❌ 'temp-data/consolidation_blueprint.csv' is missing. Please run Stage 3 (create_migration_batch.py) first.")
         return
-
-    target_batch_mls = load_target_mls(temp_data_dir)
-    if target_batch_mls:
-        logger.info(f"🎯 [MLS BATCH TARGET] Targeting {len(target_batch_mls)} specified MLS ID(s): {sorted(list(target_batch_mls))}")
-    else:
-        logger.info("🚀 [FULL MODE] Executing extraction across ALL active MLS configurations...")
 
     blueprint_mapping = {}
     skipped_identical_count = 0
@@ -144,19 +154,13 @@ def run_production_extractor():
                 clean_new_name = proposed_new_name[:-3] if proposed_new_name.endswith(".py") else proposed_new_name
 
                 if old_name == clean_new_name:
-                    logger.info(f"ℹ️ Skipping rule '{old_name}' from CSV extraction because old name matches proposed new name.")
                     skipped_identical_count += 1
                     continue
 
                 blueprint_mapping[old_name] = clean_new_name
 
     if not blueprint_mapping:
-        if skipped_identical_count > 0:
-            logger.info(f"Skipped all {skipped_identical_count} candidate rule(s) because old and proposed new names are identical. No CSV generated.")
-            if target_batch_mls:
-                update_ledger_directly(temp_data_dir, target_batch_mls)
-        else:
-            logger.info("No active rule mutations mapped in the blueprint to extract.")
+        logger.info("ℹ️ No active rule mutations mapped in consolidation_blueprint.csv.")
         return
 
     target_rules_set = set(blueprint_mapping.keys())
@@ -172,6 +176,7 @@ def run_production_extractor():
     with open(output_csv_path, mode="w", newline="", encoding="utf-8") as f:
         csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow(headers)
 
+    load_dotenv()
     ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
     ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
     ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
@@ -186,31 +191,20 @@ def run_production_extractor():
     total_match_count = 0
 
     try:
-        with open(ssh_key_path, "rb") as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=ssh_passphrase.encode() if ssh_passphrase else None,
-            )
-        pem_data = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
-
+        pkey = load_ssh_pkey(ssh_key_path, ssh_passphrase)
         logger.info(f"Establishing SSH tunnel to connect to database '{db_name}'...")
         with SSHTunnelForwarder(
-            (ssh_host, 22),
-            ssh_username=ssh_user,
-            ssh_pkey=mypkey,
-            remote_bind_address=(db_host, 5432),
+                (ssh_host, 22),
+                ssh_username=ssh_user,
+                ssh_pkey=pkey,
+                remote_bind_address=(db_host, 5432),
         ) as tunnel:
             with psycopg2.connect(
-                dbname=db_name,
-                user=db_user,
-                password=db_pass,
-                host="127.0.0.1",
-                port=tunnel.local_bind_port,
+                    dbname=db_name,
+                    user=db_user,
+                    password=db_pass,
+                    host="127.0.0.1",
+                    port=tunnel.local_bind_port,
             ) as conn:
                 cursor_name = f"master_bulk_sweep_stream_cursor_{int(time.time())}"
                 with conn.cursor(name=cursor_name) as streaming_cur:
@@ -254,13 +248,6 @@ def run_production_extractor():
                                 content_sub_type,
                                 is_enabled, raw_properties, raw_mapping_fields
                             ) = row
-
-                            if target_batch_mls and mls_id is not None:
-                                try:
-                                    if int(mls_id) not in target_batch_mls:
-                                        continue
-                                except ValueError:
-                                    continue
 
                             if isinstance(raw_properties, str):
                                 try:
@@ -345,20 +332,13 @@ def run_production_extractor():
                                     except ValueError:
                                         pass
 
-                    export_ids = captured_mls_ids or target_batch_mls
-                    if export_ids:
+                    if captured_mls_ids:
                         with open(txt_output_path, mode="w", encoding="utf-8") as txt_f:
-                            for unique_id in sorted(list(export_ids)):
+                            for unique_id in sorted(list(captured_mls_ids)):
                                 txt_f.write(f"{unique_id}\n")
 
-                if target_batch_mls:
-                    no_op_mls_ids = target_batch_mls.difference(captured_mls_ids)
-                    if no_op_mls_ids:
-                        logger.info(f"ℹ️ Found {len(no_op_mls_ids)} MLS source(s) requiring 0 rule mutations: {sorted(list(no_op_mls_ids))}")
-                        update_ledger_directly(temp_data_dir, no_op_mls_ids)
-
                 logger.info("============================================================")
-                logger.info("🚀 STAGE 4 COMPLETE: ARCHITECTURAL EXTRACTION ENGINE SUCCESSFUL")
+                logger.info("🚀 STAGE 4 COMPLETE: ARCHITECTURAL EXTRACTION ENGINE FINISHED")
                 logger.info("============================================================")
                 logger.info(f"Total Production Configurations Mutated : {total_match_count}")
                 logger.info(f"Master File Ingress Destination (CSV)   : {output_csv_path}")
@@ -366,8 +346,11 @@ def run_production_extractor():
                 logger.info("============================================================")
 
     except Exception as e:
-        logger.error(f"Critical Failure: {e}", exc_info=True)
+        logger.error(f"Critical Failure in Stage 4: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
-    run_production_extractor()
+    try:
+        run_production_extractor()
+    except (KeyboardInterrupt, SystemExit):
+        force_terminal_exit()

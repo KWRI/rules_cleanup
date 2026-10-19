@@ -1,138 +1,172 @@
 """
 Pipeline Stage 5: Staging Workspace Operator (Configuration Bulk Modification Framework).
 
-This script executes bulk structural field and rule migrations across targeted database tables.
-It supports safe evaluation passes via a validation simulation mode (`--debug`) to output verbose
-dry-run traces without mutating records. When executed with live parameters (`--do-update`), it mutates
-the nested configuration nodes in the Staging database to reflect the new PascalCase specifications.
+Executes bulk structural process map mutations across targeted database tables.
+Supports dry-run validation simulation (--debug) and live mutations (--do-update).
 
-Supports target MLS batch notice via 'temp-data/api_mls.txt' and/or 'temp-data/rets_mls.txt'
-(via rules_utils.py).
-Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
+Usage:
+  # Dry-run inspection
+  python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv --debug
+
+  # Live Staging DB update
+  python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv --do-update
 """
 
 import sys
 import os
-import importlib.util
+import signal
+import logging
+import warnings
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 
-from rules_utils import load_target_mls
-from pipeline_logger import setup_logger
 
-logger = setup_logger("Stage5_BulkUpdate")
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig=None, frame=None):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
 
-# 1. Clear active environment memory to guarantee clean isolation
-forbidden_keys = [
-    "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST",
-    "SSH_HOST", "SSH_USER", "SSH_KEY_PATH", "SSH_KEY_PASSPHRASE", "REPO_PATH"
-]
-for key in list(os.environ.keys()):
-    if key in forbidden_keys:
-        del os.environ[key]
 
-# 2. Force load ONLY the bulk tool environment variables
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+warnings.filterwarnings("ignore")
+
 current_dir = Path(__file__).resolve().parent
+
+
+def setup_logger():
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = log_dir / f"pipeline_{today_str}.log"
+
+    logger = logging.getLogger("Stage5_BulkUpdate")
+    logger.setLevel(logging.INFO)
+    if not logger.hasHandlers():
+        formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+        c_handler = logging.StreamHandler(sys.stdout)
+        c_handler.setFormatter(formatter)
+        logger.addHandler(c_handler)
+
+        f_handler = logging.FileHandler(log_file, encoding="utf-8")
+        f_handler.setFormatter(formatter)
+        logger.addHandler(f_handler)
+
+    return logger
+
+
+logger = setup_logger()
+
+# 1. Load environment variables from .env first, then override from .env.bulk if present
+standard_env_path = current_dir / ".env"
 bulk_env_path = current_dir / ".env.bulk"
+
+if standard_env_path.exists():
+    load_dotenv(dotenv_path=standard_env_path, override=True)
+
 if bulk_env_path.exists():
     load_dotenv(dotenv_path=bulk_env_path, override=True)
+    logger.info("📋 Loaded configuration overrides from '.env.bulk'.")
 
-# 3. Base paths loaded dynamically from ...env.bulk
-tools_repo = os.getenv("TOOLS_REPO_PATH")
-utils_repo = os.getenv("UTILS_REPO_PATH")
-snowflake_repo = os.getenv("SNOWFLAKE_REPO_PATH")
+# 2. Bridge DB and SSH Host aliases so bulk_map_tool finds expected keys
+if os.getenv("STAGE_DB_HOST") and not os.getenv("DB_HOST"):
+    os.environ["DB_HOST"] = os.getenv("STAGE_DB_HOST")
 
-if not tools_repo or not utils_repo:
-    logger.error("TOOLS_REPO_PATH or UTILS_REPO_PATH missing from ...env.bulk configuration.")
-    sys.exit(1)
+if os.getenv("STAGE_SSH_HOST") and not os.getenv("SSH_HOST"):
+    os.environ["SSH_HOST"] = os.getenv("STAGE_SSH_HOST")
 
-# 4. Core path injections
-sys.path.insert(0, os.path.join(tools_repo, "bulk_map_tool"))
-sys.path.insert(0, utils_repo)
-sys.path.insert(0, tools_repo)
+if os.getenv("MS_HOST") and not os.getenv("MLS_ADMIN_STAGE_URL"):
+    os.environ["MLS_ADMIN_STAGE_URL"] = os.getenv("MS_HOST")
+
+if os.getenv("MS_API_KEY") and not os.getenv("MLS_ADMIN_API_KEY"):
+    os.environ["MLS_ADMIN_API_KEY"] = os.getenv("MS_API_KEY")
+
+# 3. Path injections for external tool dependencies
+tools_repo = os.getenv("TOOLS_REPO_PATH", "").strip().strip("'\"")
+utils_repo = os.getenv("UTILS_REPO_PATH", "").strip().strip("'\"")
+snowflake_repo = os.getenv("SNOWFLAKE_REPO_PATH", "").strip().strip("'\"")
+
+if tools_repo and os.path.exists(tools_repo):
+    sys.path.insert(0, os.path.join(tools_repo, "bulk_map_tool"))
+    sys.path.insert(0, tools_repo)
+
+if utils_repo and os.path.exists(utils_repo):
+    sys.path.insert(0, utils_repo)
 
 if snowflake_repo and os.path.exists(snowflake_repo):
     sys.path.insert(0, snowflake_repo)
 
-# 5. Pydantic V2 to V1 Bridge + ANTI-.ENV DISCOVERY LAYER
-import pydantic
-import pydantic_settings
-
-
-class CleanSettings(pydantic_settings.BaseSettings):
-    model_config = pydantic_settings.SettingsConfigDict(
-        env_file=None,  # Hard block against reading physical ..env file
-        extra="ignore"  # Ignore extra keys instead of crashing
-    )
-
-
-pydantic.BaseSettings = CleanSettings
-sys.modules['pydantic'].BaseSettings = CleanSettings
-
-# 6. NAMESPACE SEPARATION INTERCEPT (Snowflake constants)
+# 4. Pydantic V2 to V1 Bridge
 try:
-    sf_inner = None
-    if snowflake_repo and os.path.exists(snowflake_repo):
-        for item in os.listdir(snowflake_repo):
-            if "snowflake" in item.lower():
-                sf_inner = os.path.join(snowflake_repo, item)
-                break
+    import pydantic
+    import pydantic_settings
 
-    if sf_inner:
-        sf_constants_path = os.path.join(sf_inner, "constants.py")
-        if os.path.exists(sf_constants_path):
-            for target_mod in ["eim_snowflake_id.constants", "eim_snowfllake_id.constants"]:
-                spec = importlib.util.spec_from_file_location(target_mod, sf_constants_path)
-                mod = importlib.util.module_from_spec(spec)
-                sys.modules[target_mod] = mod
-                spec.loader.exec_module(mod)
-except Exception as e:
-    logger.warning(f"Snowflake namespace intercept skipped: {e}")
+
+    class CleanSettings(pydantic_settings.BaseSettings):
+        model_config = pydantic_settings.SettingsConfigDict(
+            env_file=None,
+            extra="ignore"
+        )
+
+
+    pydantic.BaseSettings = CleanSettings
+    sys.modules['pydantic'].BaseSettings = CleanSettings
+except Exception:
+    pass
+
+
+def run_stage_5():
+    temp_data_dir = current_dir / "temp-data"
+    raw_targeted_csv = temp_data_dir / "raw_targeted_rules.csv"
+
+    if not raw_targeted_csv.exists() or raw_targeted_csv.stat().st_size == 0:
+        logger.info(
+            "ℹ️ No pending targeted rule mutations found in raw_targeted_rules.csv. Skipping Stage 5 DB mutation.")
+        sys.exit(0)
+
+    # Inspect if CSV contains data rows beyond header
+    with open(raw_targeted_csv, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+        if len(lines) <= 1:
+            logger.info("ℹ️ raw_targeted_rules.csv contains 0 data mutation rows. Skipping Stage 5 DB mutation.")
+            sys.exit(0)
+
+    try:
+        import bulk_map_tool
+    except ImportError as e:
+        logger.error(f"❌ Missing required dependency 'bulk_map_tool': {e}")
+        logger.error(f"Configured TOOLS_REPO_PATH: '{tools_repo}'")
+        sys.exit(1)
+
+    passthrough_args = sys.argv[1:]
+
+    if passthrough_args:
+        if "--input-file" in passthrough_args:
+            idx = passthrough_args.index("--input-file") + 1
+            if idx < len(passthrough_args):
+                input_val = passthrough_args[idx]
+                if not os.path.isabs(input_val) and "temp-data" not in input_val:
+                    resolved_path = temp_data_dir / input_val
+                    passthrough_args[idx] = str(resolved_path)
+
+        logger.info(f"Handing off execution to bulk_map_tool with args: {' '.join(passthrough_args)}")
+        sys.argv = ["bulk_map_tool.py"] + passthrough_args
+
+        # Execute underlying bulk_map_tool main loop
+        bulk_map_tool.main()
+    else:
+        logger.error("❌ No runtime arguments provided to Stage 5 bulk update operator.")
+        logger.info(
+            "Usage: python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv [--debug | --do-update]")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     try:
-        temp_data_dir = current_dir / "temp-data"
-        target_batch_mls = load_target_mls(temp_data_dir)
-        if target_batch_mls:
-            logger.info(f"🎯 [STAGING BULK UPDATE GUARD] Active MLS targets detected: {sorted(list(target_batch_mls))}")
-
-        # Check raw_targeted_rules.csv existence and line count
-        raw_targeted_csv = temp_data_dir / "raw_targeted_rules.csv"
-        if not raw_targeted_csv.exists() or raw_targeted_csv.stat().st_size == 0:
-            logger.info("ℹ️ No pending targeted rule mutations found in raw_targeted_rules.csv. Skipping Stage 5 DB mutation.")
-            sys.exit(0)
-
-        # Inspect if CSV contains actual data rows beyond header
-        with open(raw_targeted_csv, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip()]
-            if len(lines) <= 1:
-                logger.info("ℹ️ raw_targeted_rules.csv contains 0 data mutation rows. Skipping Stage 5 DB mutation.")
-                sys.exit(0)
-
-        import bulk_map_tool
-
-        passthrough_args = sys.argv[1:]
-
-        if passthrough_args:
-            if "--input-file" in passthrough_args:
-                idx = passthrough_args.index("--input-file") + 1
-                if idx < len(passthrough_args):
-                    input_val = passthrough_args[idx]
-
-                    if not os.path.isabs(input_val) and "temp-data" not in input_val:
-                        resolved_path = temp_data_dir / input_val
-                        passthrough_args[idx] = str(resolved_path)
-
-            logger.info(f"Handing off execution to bulk_map_tool with args: {' '.join(passthrough_args)}")
-
-            sys.argv = ["bulk_map_tool.py"] + passthrough_args
-            bulk_map_tool.main()
-
-        else:
-            logger.error("No runtime arguments provided to Stage 5 bulk update operator.")
-            sys.exit(1)
-
-    except ImportError as e:
-        logger.error(f"Missing Internal System Library Dependency: {e}", exc_info=True)
-    except Exception as err:
-        logger.error(f"Execution failure during runtime mapping sequence: {err}", exc_info=True)
+        run_stage_5()
+    except (KeyboardInterrupt, SystemExit):
+        force_terminal_exit()

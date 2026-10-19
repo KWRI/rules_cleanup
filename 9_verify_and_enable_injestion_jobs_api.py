@@ -4,25 +4,65 @@ Pipeline Stage 9: Ingestion Data Verifier & API Scheduler Re-Enabler.
 1. Reads batch trigger records from 'temp-data/triggered_downloads_log_api.csv'.
 2. Queries BigQuery production landing tables (`stream-listing-prod.mls_download.<content_type>`)
    using `batch_id` with polling retries to accommodate BigQuery streaming buffer flushes.
-3. Re-enables scheduled API download jobs for clean MLS targets via Production Microservice API.
-4. Triggers Production Download Manager Scheduler Sync.
+3. Re-enables scheduled API download jobs for clean MLS targets via Production/Stage Microservice API.
+4. Triggers Download Manager Scheduler Sync.
 
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
+import sys
 import csv
 import time
+import signal
+import logging
 import requests
+import warnings
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 from google.cloud import bigquery
 
-from pipeline_logger import setup_logger
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig=None, frame=None):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+warnings.filterwarnings("ignore")
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
-logger = setup_logger("Stage9_VerifyAndEnableAPI")
+load_dotenv(dotenv_path=current_dir / ".env")
+
+
+def setup_logger():
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = log_dir / f"pipeline_{today_str}.log"
+
+    logger = logging.getLogger("Stage9_VerifyAndEnableAPI")
+    logger.setLevel(logging.INFO)
+    if not logger.hasHandlers():
+        formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+        c_handler = logging.StreamHandler(sys.stdout)
+        c_handler.setFormatter(formatter)
+        logger.addHandler(c_handler)
+
+        f_handler = logging.FileHandler(log_file, encoding="utf-8")
+        f_handler.setFormatter(formatter)
+        logger.addHandler(f_handler)
+
+    return logger
+
+
+logger = setup_logger()
 
 # Locate GCP Credentials File if present
 gcp_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip().strip("'\"")
@@ -35,11 +75,13 @@ if gcp_creds_path and os.path.exists(gcp_creds_path):
 # ==============================================================================
 # ENVIRONMENT CONSTANTS
 # ==============================================================================
-MLS_ADMIN_PROD_URL = os.getenv("MLS_ADMIN_PROD_URL", "").strip().strip("'\"").rstrip("/")
-PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
-API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
+MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip(
+    "'\"").rstrip("/")
+PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[
+    0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
+API_KEY = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
 
-# Strictly use DB_USER for audit attribution
+# Audit attribution
 UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("'\"")
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "stream-listing-prod").strip().strip("'\"")
@@ -50,7 +92,8 @@ BQ_DATASET = "mls_download"
 # BIGQUERY VERIFICATION ENGINE
 # ==============================================================================
 
-def verify_batch_landing_bq(client: bigquery.Client, content_type: str, mls_id: int, batch_id: str, max_attempts: int = 5, sleep_sec: int = 10) -> int:
+def verify_batch_landing_bq(client: bigquery.Client, content_type: str, mls_id: int, batch_id: str,
+                            max_attempts: int = 5, sleep_sec: int = 10) -> int:
     """Queries BigQuery to verify rows landed for a batch ID, polling to allow streaming buffer flushes."""
     table_name = "listing" if content_type.lower() == "listing" else "open_house"
     table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{table_name}"
@@ -118,14 +161,14 @@ def enable_api_jobs(session: requests.Session, mls_ids: list[int]) -> bool:
 
 
 def sync_download_manager_scheduler(session: requests.Session) -> bool:
-    """Triggers Production Download Manager Scheduler Sync."""
+    """Triggers Download Manager Scheduler Sync."""
     url = f"{PROD_BASE_URL}/v1/download-manager/scheduler/sync"
     headers = {
         "accept": "application/json",
         "api-key": API_KEY,
     }
 
-    logger.info("🔄 ACTION: TRIGGER PRODUCTION DOWNLOAD MANAGER SCHEDULER SYNC")
+    logger.info("🔄 ACTION: TRIGGER DOWNLOAD MANAGER SCHEDULER SYNC")
     try:
         response = session.post(url, headers=headers, data="", timeout=30)
         if response.status_code in (200, 201, 202):
@@ -217,4 +260,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        force_terminal_exit()

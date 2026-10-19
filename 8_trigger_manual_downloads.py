@@ -3,9 +3,9 @@ Pipeline Stage 8: Multi-Protocol Ingestion Job Enabler & Trigger Engine (Paralle
 
 Parses target batch files ('temp-data/batch_mls_targets_rets.csv', 'temp-data/batch_mls_targets_api.csv',
 or 'temp-data/batch_mls_targets.csv') and triggers ingestion downloads in parallel:
-  - RETS Integration: Enables Jenkins jobs, triggers 'buildWithParameters' (LOAD_TYPE=incr),
+- RETS Integration: Enables Jenkins jobs, triggers 'buildWithParameters' (LOAD_TYPE=incr),
                       and polls execution status until completion concurrently.
-  - API Integration: Triggers 3-day manual reprocess downloads via Production Microservice API,
+- API Integration: Triggers 3-day manual reprocess downloads via Production/Stage Microservice API,
                      captures batch IDs as strict strings, and logs details to
                      'temp-data/triggered_downloads_log_api.csv'.
 
@@ -13,40 +13,82 @@ Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
+import sys
 import csv
 import re
 import time
+import signal
+import logging
 import requests
+import warnings
 from pathlib import Path
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from dotenv import load_dotenv
 
-from pipeline_logger import setup_logger
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig=None, frame=None):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+warnings.filterwarnings("ignore")
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
-logger = setup_logger("Stage8_TriggerDownload")
+load_dotenv(dotenv_path=current_dir / ".env")
+
+
+def setup_logger():
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = log_dir / f"pipeline_{today_str}.log"
+
+    logger = logging.getLogger("Stage8_TriggerDownload")
+    logger.setLevel(logging.INFO)
+    if not logger.hasHandlers():
+        formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+        c_handler = logging.StreamHandler(sys.stdout)
+        c_handler.setFormatter(formatter)
+        logger.addHandler(c_handler)
+
+        f_handler = logging.FileHandler(log_file, encoding="utf-8")
+        f_handler.setFormatter(formatter)
+        logger.addHandler(f_handler)
+
+    return logger
+
+
+logger = setup_logger()
 
 # ==============================================================================
 # ENVIRONMENT CONSTANTS
 # ==============================================================================
 # Jenkins Config (RETS)
-JENKINS_URL = os.getenv("JENKINS_PROD_URL", "").strip().strip("'\"")
-JENKINS_USER = os.getenv("JENKINS_USER", "").strip().strip("'\"")
-JENKINS_TOKEN = os.getenv("JENKINS_PROD_TOKEN", "").strip().strip("'\"")
+JENKINS_URL = (os.getenv("JENKINS_PROD_URL") or os.getenv("JENKINS_STAGE_URL", "")).strip().strip("'\"")
+JENKINS_USER = (os.getenv("JENKINS_USER", "")).strip().strip("'\"")
+JENKINS_TOKEN = (os.getenv("JENKINS_PROD_TOKEN") or os.getenv("JENKINS_STAGE_TOKEN", "")).strip().strip("'\"")
 
-# API Microservice Config (API Production)
-MLS_ADMIN_PROD_URL = os.getenv("MLS_ADMIN_PROD_URL", "").strip().strip("'\"").rstrip("/")
-PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
+# API Microservice Config (API)
+MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip(
+    "'\"").rstrip("/")
+PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[
+    0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
 
-API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
+API_KEY = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
 
 # Jenkins Polling Config
 POLL_INTERVAL_SEC = 15
 MAX_WAIT_MINUTES = 10
-MAX_PARALLEL_WORKERS = 8  # Parallel threads for concurrent triggers
+MAX_PARALLEL_WORKERS = 8
 
 # API Download Defaults
 DEFAULT_RELATIVE_PERIOD = "3"
@@ -61,8 +103,8 @@ def create_robust_session() -> requests.Session:
     """Creates a requests session configured with automatic retries for dropped connections."""
     session = requests.Session()
     retries = Retry(
-        total=3,  # Max 3 retries for connection blips
-        backoff_factor=2,  # Waits 2s, 4s, 8s between attempts
+        total=3,
+        backoff_factor=2,
         status_forcelist=[500, 502, 503, 504],
         raise_on_status=False
     )
@@ -89,7 +131,8 @@ def get_jenkins_crumb(session: requests.Session) -> dict:
     return {}
 
 
-def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, headers: dict, load_type: str = "incr") -> bool:
+def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, headers: dict,
+                                    load_type: str = "incr") -> bool:
     """Enables, triggers, and polls a Jenkins job until completion (Thread Worker)."""
     base_url = JENKINS_URL.rstrip("/")
 
@@ -119,7 +162,7 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
 
     if queue_url:
         logger.info(f"⏳ Waiting for build '{job_name}' to start in queue...")
-        for _ in range(12):  # Wait up to 60s for build assignment
+        for _ in range(12):
             time.sleep(5)
             try:
                 q_res = session.get(f"{queue_url.rstrip('/')}/api/json", timeout=10)
@@ -171,7 +214,8 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
                 elapsed = int(time.time() - start_time)
                 logger.info(f"⏳ Build #{build_number} ('{job_name}') in progress... (Elapsed: {elapsed}s)")
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
-            logger.warning(f"⚠️ Network blip polling status for '{job_name}': {err}. Retrying in {POLL_INTERVAL_SEC}s...")
+            logger.warning(
+                f"⚠️ Network blip polling status for '{job_name}': {err}. Retrying in {POLL_INTERVAL_SEC}s...")
 
         time.sleep(POLL_INTERVAL_SEC)
 
@@ -186,7 +230,7 @@ def process_rets_triggers_parallel(rets_targets: set):
     logger.info("------------------------------------------------------------")
 
     if not JENKINS_URL or not JENKINS_TOKEN:
-        logger.error("❌ Missing JENKINS_PROD_URL or JENKINS_PROD_TOKEN in environment configuration.")
+        logger.error("❌ Missing JENKINS_PROD_URL / JENKINS_STAGE_URL or JENKINS_TOKEN in environment configuration.")
         return
 
     session = create_robust_session()
@@ -240,7 +284,8 @@ def process_rets_triggers_parallel(rets_targets: set):
 # CODE BLOCK 2: API INGESTION MANUAL DOWNLOAD TRIGGER ENGINE
 # ==============================================================================
 
-def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str, content_type: str, content_sub_type: str, max_retries: int = 4) -> dict | None:
+def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str, content_type: str,
+                         content_sub_type: str, max_retries: int = 4) -> dict | None:
     """Triggers 3-day download for an API target with strict string batch ID casting and backoff retry logic."""
     url = f"{PROD_BASE_URL}/v1/listing-mflow/reprocess/download/mls/{mls_id}"
 
@@ -346,7 +391,7 @@ def process_api_triggers_parallel(api_targets: list[dict]):
     logger.info("------------------------------------------------------------")
 
     if not API_KEY:
-        logger.error("❌ API_KEY / MLS_ADMIN_API_KEY missing from ..env file.")
+        logger.error("❌ MLS_ADMIN_API_KEY / MS_API_KEY missing from .env file.")
         return
 
     session = create_robust_session()
@@ -464,4 +509,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        force_terminal_exit()

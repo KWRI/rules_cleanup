@@ -1,87 +1,131 @@
 """
-Pipeline Stage 10: Soft Delete Legacy Rules Script (Stage Environment)
+Pipeline Stage 10: Multi-Environment Legacy Rule Soft-Deletion Engine (Interactive & Gated).
 
-Parses 'temp-data/migration_blueprint.csv' and checks the staging database to ensure
-that targeted legacy rules are NOT currently in use by other unmigrated MLS sources.
-Only soft-deletes rules that have ZERO remaining active references via the Stage MLS Admin API.
+Verifies UI process map dependencies across both Staging and Production databases first.
+Prompts sequentially: Stage soft-deletion happens FIRST.
+If Stage fails or is skipped, Production soft-deletion is AUTOMATICALLY SKIPPED for safety.
 
-API Specification:
-    Method: DELETE
-    Endpoint: https://stage-ext-ms.data.kw.com/v1/mls-admin/rules
+API Endpoint:
+  DELETE /v1/mls-admin/rules?name=<rule_name>&deleted_by=<user>
+
+Usage:
+  python 10_soft_delete_legacy_rules.py
 """
 
 import os
 import io
 import sys
-import argparse
+import csv
+import signal
+import logging
 import requests
-import pandas as pd
+import warnings
 import psycopg2
 import paramiko
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.hazmat.primitives import serialization
 
-from pipeline_logger import setup_logger
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig=None, frame=None):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+warnings.filterwarnings("ignore")
+
+if not hasattr(paramiko, 'DSSKey'):
+    paramiko.DSSKey = paramiko.PKey
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
-logger = setup_logger("Stage10_SoftDeleteStage")
-
-# Explicit Stage Environment API Target
-API_BASE_URL = os.getenv(
-    "MLS_ADMIN_STAGE_URL",
-    "https://stage-ext-ms.data.kw.com/v1/mls-admin"
-).strip().strip("'\"").rstrip("/")
-
-API_KEY = os.getenv("MLS_ADMIN_STAGE_API_KEY") or os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
-
-# Dynamic User Fallback
-DELETED_BY_USER = (
-    os.getenv("UPDATED_BY_USER") or
-    os.getenv("CREATED_BY_USER") or
-    os.getenv("DB_USER") or
-    "migration_pipeline_bot"
-).strip().strip("'\"")
-
-HEADERS = {
-    "accept": "application/json",
-    "api-key": API_KEY,
-}
+load_dotenv(dotenv_path=current_dir / ".env")
 
 
-def load_old_rule_names_from_blueprint(blueprint_path: Path) -> list[str]:
-    """Parses the migration blueprint file and extracts unique legacy rule names."""
-    if not blueprint_path.exists():
-        logger.error(f"❌ Blueprint file not found at '{blueprint_path}'. Aborting.")
-        sys.exit(1)
+def setup_logger():
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = log_dir / f"pipeline_{today_str}.log"
 
-    path_str = str(blueprint_path)
-    df = pd.read_csv(path_str) if path_str.endswith(".csv") else pd.read_excel(path_str)
+    logger = logging.getLogger("Stage10_SoftDeleteLegacyRules")
+    logger.setLevel(logging.INFO)
+    if not logger.hasHandlers():
+        formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    column_name = "old_name"
-    if column_name not in df.columns:
-        logger.error(f"❌ Column '{column_name}' not found in '{blueprint_path}'. Aborting.")
-        sys.exit(1)
+        c_handler = logging.StreamHandler(sys.stdout)
+        c_handler.setFormatter(formatter)
+        logger.addHandler(c_handler)
 
-    # Filter out empty or null legacy names
-    legacy_rules = df[column_name].dropna().astype(str).str.strip()
-    valid_rules = [r for r in legacy_rules.unique().tolist() if r and r.lower() != "nan"]
-    return valid_rules
+        f_handler = logging.FileHandler(log_file, encoding="utf-8")
+        f_handler.setFormatter(formatter)
+        logger.addHandler(f_handler)
+
+    return logger
 
 
-def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
+logger = setup_logger()
+
+
+def load_legacy_candidates(temp_data_dir: Path) -> list[str]:
+    """Loads legacy rule candidate names from consolidation_blueprint.csv and safe_to_delete.csv."""
+    candidates = set()
+
+    # 1. Read consolidation_blueprint.csv
+    blueprint_path = temp_data_dir / "consolidation_blueprint.csv"
+    if blueprint_path.exists():
+        with open(blueprint_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                old_name = row.get("old_name", "").strip()
+                if old_name:
+                    candidates.add(old_name)
+
+    # 2. Read safe_to_delete.csv (unmapped rules)
+    safe_to_delete_path = temp_data_dir / "safe_to_delete.csv"
+    if safe_to_delete_path.exists():
+        with open(safe_to_delete_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rule_name = row.get("rule_name_to_delete", "").strip()
+                if rule_name:
+                    candidates.add(rule_name)
+
+    return sorted(list(candidates))
+
+
+def load_ssh_pkey(key_path: str, passphrase: str):
+    with open(key_path, "rb") as key_file:
+        private_key = serialization.load_pem_private_key(
+            key_file.read(),
+            password=passphrase.encode() if passphrase else None,
+        )
+    pem_data = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
+
+
+def get_active_rule_usage_counts_db(env_prefix: str, rule_names: list[str]) -> dict[str, int]:
     """
-    Connects to Staging DB over SSH tunnel to check if rules are still referenced by ANY active MLS mapping.
-    Uses LOWER() matching to guard against rule name casing variations.
+    Connects over SSH tunnel to check if rules are referenced by ANY active MLS mapping
+    in the specified environment (STAGE or PROD).
     """
-    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_host = (os.getenv(f"{env_prefix}_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip(
+        "'\"")
     ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
     ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
     ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
-    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
+    db_host = (os.getenv(f"{env_prefix}_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
     db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
     db_user = (os.getenv("DB_USER", "")).strip("'\"")
     db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
@@ -90,37 +134,27 @@ def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
     lowercased_targets = [name.lower() for name in rule_names]
 
     if not ssh_host or not ssh_key_path:
-        logger.error("❌ SSH parameters missing from ..env file. Unable to verify DB dependencies.")
-        sys.exit(1)
+        logger.error(f"❌ SSH configuration missing for {env_prefix} environment.")
+        return usage_counts
 
     try:
-        with open(ssh_key_path, "rb") as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=ssh_passphrase.encode() if ssh_passphrase else None,
-            )
-        pem_data = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
+        pkey = load_ssh_pkey(ssh_key_path, ssh_passphrase)
+        logger.info(f"Connecting to {env_prefix} DB ({db_host}) over SSH to verify active UI map references...")
 
         with SSHTunnelForwarder(
-            (ssh_host, 22),
-            ssh_username=ssh_user,
-            ssh_pkey=mypkey,
-            remote_bind_address=(db_host, 5432),
+                (ssh_host, 22),
+                ssh_username=ssh_user,
+                ssh_pkey=pkey,
+                remote_bind_address=(db_host, 5432),
         ) as tunnel:
             with psycopg2.connect(
-                dbname=db_name,
-                user=db_user,
-                password=db_pass,
-                host="127.0.0.1",
-                port=tunnel.local_bind_port,
+                    dbname=db_name,
+                    user=db_user,
+                    password=db_pass,
+                    host="127.0.0.1",
+                    port=tunnel.local_bind_port,
             ) as conn:
                 with conn.cursor() as cur:
-                    # Query active process_rule associations with CASE-INSENSITIVE match
                     query = """
                         SELECT pr.name, COUNT(mra.id) AS active_refs
                         FROM public.process_rule pr
@@ -139,100 +173,139 @@ def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
                                 usage_counts[orig_name] += count
 
     except Exception as e:
-        logger.error(f"❌ Failed to verify active rule usage from DB: {e}", exc_info=True)
-        sys.exit(1)
+        logger.error(f"❌ Failed to query {env_prefix} DB for active rule references: {e}", exc_info=True)
 
     return usage_counts
 
 
-def delete_rule_via_api(rule_name: str, deleted_by: str) -> bool:
-    """Sends a DELETE request matching the Stage Swagger API contract."""
-    endpoint = f"{API_BASE_URL}/rules" if API_BASE_URL.endswith("/mls-admin") else f"{API_BASE_URL}/v1/mls-admin/rules"
+def delete_rule_via_api(api_url: str, api_key: str, rule_name: str, deleted_by: str) -> bool:
+    """Sends a DELETE request to soft-delete the specified rule via Microservice API."""
+    endpoint = f"{api_url}/rules" if api_url.endswith("/mls-admin") else f"{api_url}/v1/mls-admin/rules"
     params = {"name": rule_name, "deleted_by": deleted_by}
+    headers = {"accept": "application/json", "api-key": api_key}
 
     try:
-        response = requests.delete(endpoint, headers=HEADERS, params=params, timeout=15)
+        response = requests.delete(endpoint, headers=headers, params=params, timeout=15)
         if response.status_code in (200, 204):
-            try:
-                data = response.json()
-                rule_id = data.get("id", "N/A")
-            except Exception:
-                rule_id = "N/A"
-            logger.info(f"   ✅ Soft-deleted rule on Stage: '{rule_name}' (ID: {rule_id}, by {deleted_by})")
+            data = response.json() if response.text else {}
+            rule_id = data.get("id", "N/A")
+            logger.info(f"   ✅ Soft-deleted legacy rule '{rule_name}' (ID: {rule_id}) via API.")
             return True
         else:
-            logger.error(f"   ❌ Failed for '{rule_name}' [HTTP {response.status_code}]: {response.text}")
+            logger.error(
+                f"   ❌ Soft-delete API failed for '{rule_name}' [HTTP {response.status_code}]: {response.text}")
             return False
     except requests.RequestException as e:
         logger.error(f"   ❌ Request exception for '{rule_name}': {e}", exc_info=True)
         return False
 
 
+def execute_deletion_pass(env_prefix: str, rules_to_delete: list[str]) -> bool:
+    """
+    Executes API soft-deletions for the specified environment.
+    Returns True ONLY if ALL candidate rules were successfully soft-deleted.
+    """
+    api_url = (os.getenv(f"MLS_ADMIN_{env_prefix}_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip(
+        "'\"").rstrip("/")
+    api_key = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
+    deleted_by_user = (os.getenv("DB_USER") or "migration_pipeline_bot").strip().strip("'\"")
+
+    if not api_url or not api_key:
+        logger.error(f"❌ Missing API configuration for {env_prefix} environment.")
+        return False
+
+    logger.info(
+        f"🚀 Starting {env_prefix} Microservice API soft-deletion sequence for {len(rules_to_delete)} rule(s)...")
+    success_count = 0
+    for name in rules_to_delete:
+        if delete_rule_via_api(api_url, api_key, name, deleted_by_user):
+            success_count += 1
+
+    logger.info(f"✅ [{env_prefix} PASS SUMMARY] Soft-deleted {success_count}/{len(rules_to_delete)} legacy rule(s).")
+    return success_count == len(rules_to_delete) and len(rules_to_delete) > 0
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Soft delete legacy rules unlinked from active Stage MLS sources.")
-    parser.add_argument("-y", "--force", action="store_true", help="Auto-confirm soft deletion without user prompt.")
-    args = parser.parse_args()
+    temp_data_dir = current_dir / "temp-data"
 
-    blueprint_file = current_dir / "temp-data" / "migration_blueprint.csv"
     logger.info("============================================================")
-    logger.info("🗑️ STAGE 10: STAGE MLS ADMIN MICROSERVICE SOFT DELETE TOOL")
+    logger.info("🗑️ STAGE 10: LEGACY RULE SOFT-DELETION ENGINE (GATED & INTERACTIVE)")
     logger.info("============================================================")
-    logger.info(f"Target Stage API Base: {API_BASE_URL}")
 
-    rule_names = load_old_rule_names_from_blueprint(blueprint_file)
-    if not rule_names:
-        logger.info("ℹ️ No legacy rules ('old_name') found in blueprint. Nothing to delete.")
+    legacy_candidates = load_legacy_candidates(temp_data_dir)
+    if not legacy_candidates:
+        logger.info("ℹ️ No legacy rules found in blueprint or safe_to_delete.csv. Nothing to delete.")
         return
 
-    logger.info(f"📄 Loaded {len(rule_names)} legacy rule candidate(s) from migration blueprint.")
+    logger.info(f"📄 Loaded {len(legacy_candidates)} legacy candidate rule(s) for verification.")
 
-    # Check active usage across remaining MLS sources
-    logger.info("🔍 Verifying active rule dependencies across unmigrated MLS sources...")
-    usage_counts = get_active_rule_usage_counts(rule_names)
+    # 1. Step 1: Query Staging DB Dependencies
+    logger.info("\n🔍 Step 1/2: Checking Staging DB active map dependencies...")
+    stage_counts = get_active_rule_usage_counts_db("STAGE", legacy_candidates)
+
+    # 2. Step 2: Query Production DB Dependencies
+    logger.info("\n🔍 Step 2/2: Checking Production DB active map dependencies...")
+    prod_counts = get_active_rule_usage_counts_db("PROD", legacy_candidates)
 
     rules_to_delete = []
-    rules_to_keep = []
+    rules_retained = []
 
-    for name in rule_names:
-        active_refs = usage_counts.get(name, 0)
-        if active_refs > 0:
-            rules_to_keep.append((name, active_refs))
+    for name in legacy_candidates:
+        s_refs = stage_counts.get(name, 0)
+        p_refs = prod_counts.get(name, 0)
+
+        if s_refs > 0 or p_refs > 0:
+            rules_retained.append((name, s_refs, p_refs))
         else:
             rules_to_delete.append(name)
 
-    if rules_to_keep:
-        logger.info(f"⚠️ Retaining {len(rules_to_keep)} rule(s) because they are still used by unmigrated MLSs:")
-        for name, refs in rules_to_keep:
-            logger.info(f"   • '{name}' (Used by {refs} active mapping(s) — SKIPPED)")
+    if rules_retained:
+        logger.info(
+            f"\n⚠️ Retaining {len(rules_retained)} rule(s) because they are still referenced by active UI maps:")
+        for name, s_refs, p_refs in rules_retained:
+            logger.info(f"   • '{name}' -> Active References: Stage={s_refs}, Prod={p_refs} (SKIPPED)")
 
     if not rules_to_delete:
-        logger.info("🎉 No rules are ready for soft-deletion in Stage (all rules are still shared by unmigrated MLSs).")
+        logger.info("\n🎉 No legacy rules are ready for soft-deletion (all candidates are still in active use).")
         return
 
-    logger.info(f"✅ Ready to soft-delete {len(rules_to_delete)} fully unlinked legacy rule(s) from Stage:")
+    logger.info(f"\n✅ Verified {len(rules_to_delete)} fully unlinked legacy rule(s) ready for soft-deletion:")
     for idx, name in enumerate(rules_to_delete, 1):
         logger.info(f"   {idx}. {name}")
 
-    if not args.force:
-        if not sys.stdin.isatty():
-            logger.warning("⚠️ Non-interactive session detected without --force flag. Aborting for safety.")
-            return
+    # --- INTERACTIVE PROMPT 1: STAGE ---
+    print("\n" + "=" * 60)
+    stage_confirm = input(
+        f"Do you want to soft-delete these {len(rules_to_delete)} legacy rule(s) on STAGE? (yes/no): ").strip().lower()
 
-        confirm = input(f"\nConfirm soft-deletion of {len(rules_to_delete)} unlinked Stage rule(s)? (y/N): ")
-        if confirm.lower() != "y":
-            logger.info("Operation cancelled by user.")
-            return
+    stage_success = False
+    if stage_confirm in ["yes", "y"]:
+        stage_success = execute_deletion_pass("STAGE", rules_to_delete)
+    else:
+        logger.info("⏩ [STAGE] Soft-deletion skipped by user.")
 
-    logger.info("🚀 Starting Stage API deletion sequence...")
-    success_count = 0
-    for name in rules_to_delete:
-        if delete_rule_via_api(name, DELETED_BY_USER):
-            success_count += 1
+    # --- STRICT PROD GATE: ONLY PROMPT IF STAGE SUCCEEDED ---
+    print("\n" + "=" * 60)
+    if not stage_success:
+        logger.warning(
+            "⛔ [PROD GATE BLOCK] Skipping Production soft-deletion because Stage soft-deletion was skipped or failed.")
+        logger.info("============================================================")
+        return
 
-    logger.info("============================================================")
-    logger.info(f"✅ STAGE 10 FINISHED: Soft-deleted {success_count}/{len(rules_to_delete)} rule(s) via Stage API.")
+    prod_confirm = input(
+        f"Stage soft-deletion completed successfully. Do you want to soft-delete these {len(rules_to_delete)} legacy rule(s) on PROD? (yes/no): ").strip().lower()
+    if prod_confirm in ["yes", "y"]:
+        execute_deletion_pass("PROD", rules_to_delete)
+    else:
+        logger.info("⏩ [PROD] Soft-deletion skipped by user.")
+
+    logger.info("\n============================================================")
+    logger.info("✅ STAGE 10 INTERACTIVE SOFT-DELETION SEQUENCE FINISHED")
     logger.info("============================================================")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        force_terminal_exit()

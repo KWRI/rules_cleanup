@@ -10,31 +10,73 @@ Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
+import sys
 import csv
 import re
+import signal
+import logging
 import requests
+import warnings
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 
-from pipeline_logger import setup_logger
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig=None, frame=None):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+warnings.filterwarnings("ignore")
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
-logger = setup_logger("Stage6_DisableIngestionJobs")
+load_dotenv(dotenv_path=current_dir / ".env")
+
+
+def setup_logger():
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = log_dir / f"pipeline_{today_str}.log"
+
+    logger = logging.getLogger("Stage6_DisableIngestionJobs")
+    logger.setLevel(logging.INFO)
+    if not logger.hasHandlers():
+        formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+        c_handler = logging.StreamHandler(sys.stdout)
+        c_handler.setFormatter(formatter)
+        logger.addHandler(c_handler)
+
+        f_handler = logging.FileHandler(log_file, encoding="utf-8")
+        f_handler.setFormatter(formatter)
+        logger.addHandler(f_handler)
+
+    return logger
+
+
+logger = setup_logger()
 
 # Jenkins Config (RETS)
-JENKINS_URL = os.getenv("JENKINS_PROD_URL", "").strip().strip("'\"")
-JENKINS_USER = os.getenv("JENKINS_USER", "").strip().strip("'\"")
-JENKINS_TOKEN = os.getenv("JENKINS_PROD_TOKEN", "").strip().strip("'\"")
+JENKINS_URL = (os.getenv("JENKINS_PROD_URL") or os.getenv("JENKINS_STAGE_URL", "")).strip().strip("'\"")
+JENKINS_USER = (os.getenv("JENKINS_USER", "")).strip().strip("'\"")
+JENKINS_TOKEN = (os.getenv("JENKINS_PROD_TOKEN") or os.getenv("JENKINS_STAGE_TOKEN", "")).strip().strip("'\"")
 
-# API Microservice Config (API Production)
-MLS_ADMIN_PROD_URL = os.getenv("MLS_ADMIN_PROD_URL", "").strip().strip("'\"").rstrip("/")
-PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
+# API Microservice Config (API)
+MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip(
+    "'\"").rstrip("/")
+PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[
+    0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
 
 API_BASE_URL = MLS_ADMIN_PROD_URL
-MLS_ADMIN_API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
+MLS_ADMIN_API_KEY = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
 
-# Strictly use DB_USER for audit attribution
+# Audit attribution user
 UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("'\"")
 
 
@@ -43,9 +85,9 @@ UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("
 # ==============================================================================
 
 def get_all_jenkins_jobs() -> list:
-    """Fetch all job names and URLs from the Production Jenkins API."""
+    """Fetch all job names and URLs from the Jenkins API."""
     if not JENKINS_URL or not JENKINS_TOKEN:
-        logger.error("Missing JENKINS_PROD_URL or JENKINS_PROD_TOKEN in environment configuration.")
+        logger.error("Missing JENKINS_PROD_URL / JENKINS_STAGE_URL or JENKINS_TOKEN in environment configuration.")
         return []
 
     base_url = JENKINS_URL.rstrip("/")
@@ -56,18 +98,18 @@ def get_all_jenkins_jobs() -> list:
         if response.status_code == 200:
             return response.json().get("jobs", [])
         elif response.status_code == 401:
-            logger.error("Jenkins Authentication failed (401). Please check JENKINS_PROD_TOKEN.")
+            logger.error("Jenkins Authentication failed (401). Please check JENKINS_TOKEN.")
             return []
         else:
             logger.error(f"Failed to fetch Jenkins jobs. HTTP Status: {response.status_code}")
             return []
     except Exception as err:
-        logger.error(f"Error connecting to Production Jenkins: {err}")
+        logger.error(f"Error connecting to Jenkins: {err}")
         return []
 
 
 def disable_jenkins_job(job_name: str) -> bool:
-    """Disables a specific Production Jenkins job."""
+    """Disables a specific Jenkins job."""
     base_url = JENKINS_URL.rstrip("/")
     url = f"{base_url}/job/{job_name}/disable"
 
@@ -115,13 +157,13 @@ def process_rets_disabling(rets_targets: set):
 # ==============================================================================
 
 def trigger_scheduler_sync() -> bool:
-    """Triggers Download Manager Scheduler Sync POST call on Production."""
+    """Triggers Download Manager Scheduler Sync POST call."""
     if not PROD_BASE_URL:
-        logger.error("Missing MLS_ADMIN_PROD_URL in environment configuration.")
+        logger.error("Missing MLS_ADMIN_PROD_URL / MLS_ADMIN_STAGE_URL in environment configuration.")
         return False
 
     sync_url = f"{PROD_BASE_URL}/v1/download-manager/scheduler/sync"
-    logger.info("🔄 ACTION: TRIGGER PRODUCTION DOWNLOAD MANAGER SCHEDULER SYNC")
+    logger.info("🔄 ACTION: TRIGGER DOWNLOAD MANAGER SCHEDULER SYNC")
     logger.info(f"Target Endpoint : {sync_url}")
 
     headers = {
@@ -144,9 +186,9 @@ def trigger_scheduler_sync() -> bool:
 
 
 def disable_api_download_jobs_batch(mls_ids: list[int]) -> bool:
-    """Disables MLS Download Jobs for target sources on Production API using numeric mls_id list."""
+    """Disables MLS Download Jobs for target sources using numeric mls_id list."""
     if not API_BASE_URL:
-        logger.error("Missing MLS_ADMIN_PROD_URL in environment configuration.")
+        logger.error("Missing MLS_ADMIN_PROD_URL / MLS_ADMIN_STAGE_URL in environment configuration.")
         return False
 
     endpoint = f"{API_BASE_URL}/mls/download/jobs/disable"
@@ -256,4 +298,7 @@ def run_job_disabling():
 
 
 if __name__ == "__main__":
-    run_job_disabling()
+    try:
+        run_job_disabling()
+    except (KeyboardInterrupt, SystemExit):
+        force_terminal_exit()

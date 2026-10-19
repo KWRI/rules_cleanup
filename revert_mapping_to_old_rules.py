@@ -1,40 +1,78 @@
 """
-Text-Based Reverse Mapping Converter (Rollback Utility).
+Text-Based Reverse Mapping Converter (Emergency Rollback Utility).
 
-Reads 'temp-data/migration_blueprint.csv' to dynamically map newly standardized PascalCase
-rule names back to their exact legacy string formats (e.g., 'ConvertObjectMapperToList' ->
-'Convert ObjectMapper to List'). Performs structured CSV field substitutions across 'raw_targeted_rules.csv'
-and outputs the payload to 'reverse_targeted_rules.csv'.
+Reads 'temp-data/consolidation_blueprint.csv' (or 'migration_blueprint.csv') to dynamically map
+newly standardized generic rule names back to their exact legacy string formats.
+Performs structured CSV field substitutions across 'raw_targeted_rules.csv'
+and outputs the rollback payload to 'reverse_targeted_rules.csv'.
+
+Usage:
+  1. Generate reverse CSV payload:
+     python revert_mapping_to_old_rules.py
+
+  2. Apply rollback to Staging DB:
+     python 5_run_bulk_update.py --input-file temp-data/reverse_targeted_rules.csv --do-update
 
 Logs execution details to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
+import os
+import sys
 import csv
 import json
-import sys
+import signal
+import logging
+import warnings
 from pathlib import Path
+from datetime import datetime
+from dotenv import load_dotenv
 
 from pipeline_logger import setup_logger
 
-current_dir = Path(__file__).resolve().parent
-temp_data_dir = current_dir / "temp-data"
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig=None, frame=None):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
 
-blueprint_path = temp_data_dir / "migration_blueprint.csv"
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+warnings.filterwarnings("ignore")
+
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
+
+logger = setup_logger("RevertMappings")
+
+temp_data_dir = current_dir / "temp-data"
 raw_rules_path = temp_data_dir / "raw_targeted_rules.csv"
 output_reverse_path = temp_data_dir / "reverse_targeted_rules.csv"
 
-logger = setup_logger("RevertMappings")
+
+def resolve_blueprint_path() -> Path | None:
+    """Finds active consolidation or migration blueprint file."""
+    candidates = [
+        temp_data_dir / "consolidation_blueprint.csv",
+        temp_data_dir / "migration_blueprint.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
 
 
 def generate_reverse_targeted_rules() -> None:
     logger.info("============================================================")
-    logger.info("🔄 REVERSE TARGETED RULES GENERATOR INITIALIZED")
+    logger.info("🔄 REVERSE TARGETED RULES GENERATOR INITIALIZED (ROLLBACK)")
     logger.info("============================================================")
 
+    blueprint_path = resolve_blueprint_path()
+
     # --- Validation Checks ---
-    if not blueprint_path.exists():
-        logger.error(f"❌ Migration blueprint missing at: {blueprint_path}")
-        logger.error("   Ensure Stage 2 generated 'migration_blueprint.csv' first.")
+    if not blueprint_path or not blueprint_path.exists():
+        logger.error("❌ Migration blueprint missing in 'temp-data/'.")
+        logger.error("   Expected 'consolidation_blueprint.csv' or 'migration_blueprint.csv'.")
         sys.exit(1)
 
     if not raw_rules_path.exists():
@@ -42,7 +80,7 @@ def generate_reverse_targeted_rules() -> None:
         logger.error("   Ensure Stage 4 generated 'raw_targeted_rules.csv' first.")
         sys.exit(1)
 
-    logger.info("[1/2] Loading reversal mappings from migration blueprint...")
+    logger.info(f"[1/2] Loading reversal mappings from blueprint: '{blueprint_path.name}'...")
 
     # Load reverse mappings: clean_new_name -> old_name
     reverse_mappings = {}
@@ -50,15 +88,18 @@ def generate_reverse_targeted_rules() -> None:
         reader = csv.DictReader(f)
         for row in reader:
             old_name = row.get("old_name", "").strip()
-            # Support both "target_new_name" (Stage 2 default) and "new_name" fallback
-            new_name = (row.get("target_new_name") or row.get("new_name") or "").strip()
+            new_name = (
+                row.get("target_new_name") or
+                row.get("generic_rule_name") or
+                row.get("new_name") or ""
+            ).strip()
 
             if not old_name or not new_name:
                 continue
 
             clean_new_name = new_name[:-3] if new_name.endswith(".py") else new_name
 
-            # Only track mapping if the rule name actually changed
+            # Only track mapping if rule name was modified
             if old_name != clean_new_name:
                 reverse_mappings[clean_new_name] = old_name
 
@@ -81,7 +122,6 @@ def generate_reverse_targeted_rules() -> None:
 
             if rule_func_raw:
                 try:
-                    # Parse JSON array (e.g. '["PascalCaseRule"]')
                     funcs = json.loads(rule_func_raw)
                     if isinstance(funcs, list):
                         updated_funcs = []
@@ -101,7 +141,6 @@ def generate_reverse_targeted_rules() -> None:
                         total_replacements += 1
 
                 except (json.JSONDecodeError, TypeError):
-                    # Fallback string replace strictly on rule_func column if not valid JSON
                     for new_name, old_name in reverse_mappings.items():
                         if new_name in rule_func_raw:
                             rule_func_raw = rule_func_raw.replace(new_name, old_name)
@@ -110,7 +149,7 @@ def generate_reverse_targeted_rules() -> None:
 
             reverted_rows.append(row)
 
-    # Output to reverse target file safely
+    # Output to reverse target file
     with open(output_reverse_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -126,4 +165,7 @@ def generate_reverse_targeted_rules() -> None:
 
 
 if __name__ == "__main__":
-    generate_reverse_targeted_rules()
+    try:
+        generate_reverse_targeted_rules()
+    except (KeyboardInterrupt, SystemExit):
+        force_terminal_exit()
