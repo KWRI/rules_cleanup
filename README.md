@@ -29,7 +29,6 @@ This project relies on local sibling repositories referenced in `.env.bulk` and 
    ```bash
    git clone git@github.com:kwri/rules_cleanup.git
    cd rules_cleanup
-
    ```
 
 2. **Set up a Virtual Environment:**
@@ -49,14 +48,15 @@ This project relies on local sibling repositories referenced in `.env.bulk` and 
 
    # macOS / Linux:
    source .venv/bin/activate
-
    ```
+
 3. **Install Dependencies:**
    ```bash
    python -m pip install --upgrade pip
    pip install -r requirements.txt
-
    ```
+
+---
 
 ## ⚙️ Environment Configuration
 
@@ -103,7 +103,6 @@ JENKINS_PROD_TOKEN=your_jenkins_prod_token
 # Google BigQuery (Landing Verification)
 GCP_PROJECT_ID=stream-listing-prod
 GOOGLE_APPLICATION_CREDENTIALS=C:/Users/your.username/path/to/gcp_creds.json
-
 ```
 
 ### `.env.bulk`
@@ -117,8 +116,9 @@ LOG_LEVEL=DEBUG
 TOOLS_REPO_PATH=C:/Users/your.username/Documents/GitHub/eim-slp-tools
 UTILS_REPO_PATH=C:/Users/your.username/Documents/GitHub/eim-utilities-pip
 SNOWFLAKE_REPO_PATH=C:/Users/your.username/Documents/GitHub/eim-snowflake-id
-
 ```
+
+---
 
 ## 🏃 Execution Methods
 
@@ -134,7 +134,6 @@ Runs with interactive `(y/N)` confirmation prompts before mutating Staging DB, d
 
 ```bash
 python run_pipeline.py -l 9999
-
 ```
 
 #### Automated / CI Mode
@@ -143,7 +142,6 @@ Skips interactive prompts and automatically sleeps for BigQuery log landing:
 
 ```bash
 python run_pipeline.py -l 9999 --auto-approve --wait-mins 5
-
 ```
 
 #### Command Flags for `run_pipeline.py`
@@ -151,6 +149,8 @@ python run_pipeline.py -l 9999 --auto-approve --wait-mins 5
 - `-l, --limit <int>`: Batch limit parameter for Stage 1 AST clustering (Default: `9999`).
 - `--auto-approve`: Bypasses manual `(y/N)` confirmation prompts.
 - `--wait-mins <int>`: Minutes to pause after triggering reprocess downloads (Stage 8) before verifying BigQuery landing (Stage 9) (Default: `5`).
+
+---
 
 ### Method 2: Manual / Sequential Stage Execution
 
@@ -160,8 +160,9 @@ If you need to execute specific stages individually, run the scripts in the foll
 # Stage 1: Group Identical Legacy Custom Rules by AST Code Structure
 python 1_group_similar_rules.py -l 9999
 
-# Stage 2: Derive Generic Target Names & Register Missing Generic Rules via API
-python 2_create_generic_target_rules.py
+# Stage 2: Preview & Create Active Generic Target Rules
+python 2_create_generic_target_rules.py               # Step 1: Generate preview CSV & inspect targets
+python 2_create_generic_target_rules.py --do-creation  # Step 2: Register missing target rules via API
 
 # Stage 3: Generate Consolidation Blueprint & Target MLS CSV Manifests
 python 3_create_migration_batch.py
@@ -173,41 +174,47 @@ python 4_generate_targeted_csv.py
 python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv --debug
 python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv --do-update
 
+# Flush Staging API Cache via Remote Deployment Server (sdh.data.kw.com):
+# Run 'm_u' then 'map_update_stage' in SDH shell
+
 # Stage 6: Disable Production Ingestion Jobs (Jenkins & API Service)
 python 6_disable_ingestion_jobs.py
 
 # Stage 7: Production Promotion Engine (Remote SDH SSH Shell Runner)
-python 7_bulk_promotion_engine.py
+python 7_run_bulk_promotion.py
 
 # Stage 8: Enable Ingestion Jobs & Trigger 3-Day Reprocess Test Downloads
-python 8_trigger_downloads.py
+python 8_trigger_manual_downloads.py
 
 # --- Wait ~5 Minutes to Allow Production BigQuery Data Landing ---
 
 # Stage 9: Verify BigQuery Landing Logs & Re-Enable Verified API Schedules
-python 9_verify_and_enable_api.py
+python 9_verify_and_enable_injestion_jobs_api.py
 
 # Stage 10: Safe Soft-Delete Unlinked Legacy Rules via API (Gated & Interactive)
 python 10_soft_delete_legacy_rules.py
 
-# Stage 11: Finalize DB Ledger, Sync Repo Files, Purge temp-data/, & Git Push
-python 11_sync_and_commit_repo.py
-
+# Stage 11: Finalize DB Ledger, Sync Repo Files, Purge temp-data/, & Git Commit/Push
+python 11_update_consolidated_repo.py
 ```
+
+---
 
 ## 📋 Script Execution Sequence Reference
 
 - **`1_group_similar_rules.py`**: Connects to DB, parses Python rule ASTs, clusters identical legacy custom rules, and outputs structural comparison groups.
-- **`2_create_generic_target_rules.py`**: Resolves generic target names (e.g., `ListStatusIdV1`), registers any missing generic rules in Staging via Microservice API, and updates `public.processed_rules_ledger` to `IN_PROGRESS`.
+- **`2_create_generic_target_rules.py`**: Resolves generic target names (e.g., `ListStatusIdV1`, `AgentOfficeKeysV2`), generates a preview CSV, registers missing active rules in Staging via Microservice API, and updates `public.processed_rules_ledger` to `IN_PROGRESS`.
 - **`3_create_migration_batch.py`**: Correlates target rule names with active process maps to generate `consolidation_blueprint.csv` and `batch_mls_targets.csv`.
 - **`4_generate_targeted_csv.py`**: Traverses process maps in Staging DB and generates mutation payload `raw_targeted_rules.csv` and `promotion_sources.txt`.
 - **`5_run_bulk_update.py`**: Applies bulk JSON schema updates directly to the Staging database via microservice API handoff (`bulk_map_tool`).
 - **`6_disable_ingestion_jobs.py`**: Pauses active Production Jenkins jobs (RETS) and API ingestion schedules prior to promotion.
-- **`7_bulk_promotion_engine.py`**: Uploads deployment manifests via SFTP to the remote SDH host and runs interactive promotion scripts (`promote_source.py`).
-- **`8_trigger_downloads.py`**: Re-enables ingestion schedules and triggers parallel 3-day reprocessing ranges in Production, saving batch logs to `triggered_downloads_log_api.csv`.
-- **`9_verify_and_enable_api.py`**: Queries BigQuery landing tables (`mls_download`) by `batch_id`, validates row counts, and restores scheduled API download jobs for clean MLS targets.
-- **`10_soft_delete_legacy_rules.py`**: Performs dual-environment DB dependency checks (Staging & Prod) to verify rules have 0 active mapping references before soft-deleting them interactively via API.
-- **`11_sync_and_commit_repo.py`**: Marks evaluated rules as `COMPLETED` in `public.processed_rules_ledger`, extracts fresh rules to `ui-rules/active/` and `ui-rules/archived/`, purges `temp-data/`, and executes `git add`, `commit`, and `push` on the `dm-consolidated-rules` repository.
+- **`7_run_bulk_promotion.py`**: Uploads deployment manifests via SFTP to the remote SDH host (`sdh.data.kw.com`) and invokes interactive promotion scripts (`promote_source.py`).
+- **`8_trigger_manual_downloads.py`**: Re-enables ingestion schedules and triggers parallel 3-day reprocessing ranges in Production, saving batch logs to `triggered_downloads_log_api.csv`.
+- **`9_verify_and_enable_injestion_jobs_api.py`**: Queries BigQuery landing tables (`stream-listing-prod.mls_download.listing`) by `batch_id`, validates row counts, and restores scheduled API download jobs for clean MLS targets.
+- **`10_soft_delete_legacy_rules.py`**: Performs dual-environment DB dependency checks (Staging & Prod) to verify rules have 0 active mapping references before soft-deleting them interactively via API. Automatically retains rules on Production if an active map reference is detected (e.g., `ParagonAgentOfficePhone`).
+- **`11_update_consolidated_repo.py`**: Marks evaluated rules as `COMPLETED` in `public.processed_rules_ledger`, extracts fresh rules to `ui-rules/active/` and `ui-rules/archived/`, purges `temp-data/`, and executes `git add`, `commit`, and `push` on the `dm-consolidated-rules` repository.
+
+---
 
 ## 📂 Key State & Artifact Files in `temp-data/`
 
@@ -218,6 +225,13 @@ During pipeline execution, intermediate files are managed inside `temp-data/` (a
 - **`promotion_sources.txt`**: Numerically sorted list of affected MLS IDs staged on the SDH remote server for Stage 7 promotion.
 - **`triggered_downloads_log_api.csv`**: Operational log generated in Stage 8 storing `batch_id` values queried during Stage 9 BigQuery verification.
 
+> 💡 **Note on Windows / OneDrive Environments:** If Stage 11 raises `[WinError 5] Access is denied` while purging `temp-data/`, these warnings are harmless. Database ledger updates, file extractions, and Git commit/push operations complete successfully regardless. Remaining scratch files can be purged manually via:
+> ```powershell
+> Remove-Item -Path .\temp-data\* -Recurse -Force -ErrorAction SilentlyContinue
+> ```
+
+---
+
 ## 🛡️ Emergency Rollback & Safety Protocols
 
 ### Dry-Run Verification
@@ -226,7 +240,6 @@ Always execute **Stage 5** with `--debug` prior to passing `--do-update` to insp
 
 ```bash
 python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv --debug
-
 ```
 
 ### Emergency Staging UI Map Rollback
@@ -239,13 +252,32 @@ python revert_mapping_to_old_rules.py
 
 # 2. Re-apply legacy rule functions in Staging DB
 python 5_run_bulk_update.py --input-file temp-data/reverse_targeted_rules.csv --do-update
-
 ```
+
+### Baseline Reset via Reverse Promotion (Prod → Stage)
+
+If Staging process map associations lose alignment or contain soft-deleted targets, restore the exact Production configurations back into Staging before running Stage 1:
+
+1. SSH into the SDH remote deployment server (`sdh.data.kw.com`) and navigate to source promotion:
+   ```bash
+   s_p
+   set_promotion prod stage
+   ```
+2. Re-promote exact active Production process maps back into Staging for target feeds:
+   ```bash
+   for id in 193 430 439 496; do python promote_source.py -s process "$id" -y; done
+   ```
+3. Reset today's locked ledger status back to `PENDING` in Stage DB (`mls_admin`):
+   ```sql
+   UPDATE public.processed_rules_ledger 
+   SET status = 'PENDING', updated_at = CURRENT_TIMESTAMP 
+   WHERE status = 'IN_PROGRESS' AND DATE(created_at) = CURRENT_DATE;
+   ```
 
 ### Recovery from Paused Pipeline Ingestion Jobs
 
 If pipeline execution halts after Stage 6 (where download jobs are disabled), re-enable verified ingestion schedules by running Stage 9 directly:
 
 ```bash
-python 9_verify_and_enable_api.py
+python 9_verify_and_enable_injestion_jobs_api.py
 ```
