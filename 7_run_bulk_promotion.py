@@ -4,8 +4,9 @@ Pipeline Stage 7: Bulk Production Promotion Engine & Slack Draft Generator.
 Promotes newly standardized rules, schema maps, and metadata to the Production environment:
 1. Reads target numeric MLS IDs directly from 'temp-data/promotion_sources.txt' (or auto-builds it).
 2. Generates a formatted Slack promotion notification message and copies it to the clipboard.
-3. Stages the manifest file on the remote deployment server over SFTP using a user-specific filename.
-4. Invokes an interactive SSH shell to execute remote promotion commands ('s_p',
+3. Prompts the operator for explicit Y/N confirmation before proceeding to production updates.
+4. Stages the manifest file on the remote deployment server over SFTP using a user-specific filename.
+5. Invokes an interactive SSH shell to execute remote promotion commands ('s_p',
    'set_promotion stage prod', and 'promote_source.py').
 
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
@@ -142,6 +143,15 @@ def get_target_mls_ids(manifest_path: Path) -> list[int]:
     return unique_ids
 
 
+def prompt_user_confirmation(prompt_text: str) -> bool:
+    """Prompts the operator for explicit Y/N confirmation."""
+    try:
+        answer = input(f"\n⚠️  {prompt_text} (y/N): ").strip().lower()
+        return answer == "y"
+    except (KeyboardInterrupt, EOFError):
+        force_terminal_exit()
+
+
 def main() -> None:
     logger.info("============================================================")
     logger.info("🚀 STAGE 7: PRODUCTION PROMOTION ENGINE INITIALIZED")
@@ -165,6 +175,18 @@ def main() -> None:
         draft_slack_message()
     except Exception as err:
         logger.warning(f"⚠️ Slack draft generator skipped: {err}")
+
+    # ------------------------------------------------------------
+    # INTERACTIVE SAFETY GATE: CONFIRM BEFORE PROCEEDING
+    # ------------------------------------------------------------
+    confirmation = prompt_user_confirmation(
+        f"Slack message drafted and copied to clipboard for {len(mls_ids)} MLS feed(s).\n"
+        f"   Are you ready to proceed with LIVE PRODUCTION PROMOTION on {SSH_HOST}?"
+    )
+
+    if not confirmation:
+        logger.warning("Pipeline aborted by user prior to remote Production promotion.")
+        sys.exit(0)
 
     # ------------------------------------------------------------
     # 2. SFTP MANIFEST STAGING

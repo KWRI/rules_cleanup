@@ -6,6 +6,8 @@ Implements multi-tier candidate scoring:
   3. Priority 3: Fallback to oldest created_at
 
 Performs CASE-INSENSITIVE DB checks and 100% AST logic identity verification.
+Detects soft-deleted Stage DB rules and forces a versioned suffix (e.g., V1, V2)
+to avoid API 404 lookup crashes during downstream promotion.
 
 Modes:
   python 2_create_generic_target_rules.py               # DEFAULT: Preview mode (Generates CSV preview ONLY)
@@ -155,28 +157,32 @@ def get_db_connection_params():
     return ssh_host, ssh_user, ssh_key_path, ssh_passphrase, db_host, db_name, db_user, db_pass
 
 
-def get_existing_db_rules_with_metadata(logger: logging.Logger) -> dict:
+def get_existing_db_rules_with_metadata(logger: logging.Logger) -> tuple[dict, set]:
     ssh_host, ssh_user, ssh_key_path, ssh_passphrase, db_host, db_name, db_user, db_pass = get_db_connection_params()
     existing_rules = {}
+    deleted_rules_lower = set()
     try:
         pkey = load_ssh_pkey(ssh_key_path, ssh_passphrase)
-        logger.info("Connecting to DB to query existing active rule content and timestamps...")
+        logger.info("Connecting to DB to query existing active and soft-deleted rules...")
         with SSHTunnelForwarder((ssh_host, 22), ssh_username=ssh_user, ssh_pkey=pkey,
                                 remote_bind_address=(db_host, 5432)) as tunnel:
             with psycopg2.connect(dbname=db_name, user=db_user, password=db_pass, host="127.0.0.1",
                                   port=tunnel.local_bind_port) as conn:
                 with conn.cursor() as cur:
                     query = """
-                        SELECT name, content, COALESCE(updated_at, created_at) AS updated_at, created_at 
-                        FROM public.process_rule 
-                        WHERE deleted_at IS NULL;
+                        SELECT name, content, COALESCE(updated_at, created_at) AS updated_at, created_at, deleted_at 
+                        FROM public.process_rule;
                     """
                     cur.execute(query)
-                    for r_name, r_content, r_updated, r_created in cur.fetchall():
-                        existing_rules[r_name.lower()] = (r_name, r_content or "", r_updated, r_created)
+                    for r_name, r_content, r_updated, r_created, r_deleted in cur.fetchall():
+                        r_name_lower = r_name.lower()
+                        if r_deleted is not None:
+                            deleted_rules_lower.add(r_name_lower)
+                        else:
+                            existing_rules[r_name_lower] = (r_name, r_content or "", r_updated, r_created)
     except Exception as e:
         logger.error(f"Database error while fetching existing rules: {e}", exc_info=True)
-    return existing_rules
+    return existing_rules, deleted_rules_lower
 
 
 def select_best_candidate_rule(rules: set, existing_rules_lower: dict) -> tuple[str, str]:
@@ -330,7 +336,7 @@ def resolve_generic_targets(do_creation: bool = False):
         logger.info("No 'Identical' rule clusters found in comparison report.")
         return
 
-    existing_rules_lower = get_existing_db_rules_with_metadata(logger)
+    existing_rules_lower, deleted_rules_lower = get_existing_db_rules_with_metadata(logger)
     resolved_mapping = {}
 
     for group_folder, rules in identical_groups.items():
@@ -346,7 +352,21 @@ def resolve_generic_targets(do_creation: bool = False):
         target_name = base_generic_name
         action = "REUSE_EXISTING"
 
-        if target_name.lower() in existing_rules_lower:
+        # --- CHECK IF PROPOSED TARGET NAME IS SOFT-DELETED IN STAGE DB ---
+        if target_name.lower() in deleted_rules_lower:
+            version = 1
+            versioned_target = f"{base_generic_name}V{version}"
+            while versioned_target.lower() in existing_rules_lower or versioned_target.lower() in deleted_rules_lower:
+                version += 1
+                versioned_target = f"{base_generic_name}V{version}"
+
+            target_name = versioned_target
+            action = "CREATE_NEW"
+            logger.info(
+                f"Group '{group_folder}' -> Base generic rule '{base_generic_name}' is SOFT-DELETED in Stage DB. Proposed NEW versioned rule '{target_name}' (Action: {action})"
+            )
+
+        elif target_name.lower() in existing_rules_lower:
             actual_db_name, db_code, _, _ = existing_rules_lower[target_name.lower()]
 
             if are_ast_structures_identical(candidate_code, db_code):
@@ -359,12 +379,14 @@ def resolve_generic_targets(do_creation: bool = False):
                 version = 1
                 versioned_target = f"{base_generic_name}V{version}"
 
-                while versioned_target.lower() in existing_rules_lower:
-                    actual_v_name, v_code, _, _ = existing_rules_lower[versioned_target.lower()]
-                    if are_ast_structures_identical(candidate_code, v_code):
-                        versioned_target = actual_v_name
-                        action = "REUSE_EXISTING"
-                        break
+                while versioned_target.lower() in existing_rules_lower or versioned_target.lower() in deleted_rules_lower:
+                    actual_v_data = existing_rules_lower.get(versioned_target.lower())
+                    if actual_v_data:
+                        actual_v_name, v_code, _, _ = actual_v_data
+                        if v_code and are_ast_structures_identical(candidate_code, v_code):
+                            versioned_target = actual_v_name
+                            action = "REUSE_EXISTING"
+                            break
                     version += 1
                     versioned_target = f"{base_generic_name}V{version}"
 
