@@ -1,6 +1,7 @@
 """
 Groups and Compares Database Rules by Logic Equivalency with Ledger Locking & File Exclusion Rules.
 Equipped with OS-level instant terminal abort signal handlers (SIGINT / SIGBREAK).
+Extracts created_at and updated_at to enable recency-aware candidate selection.
 """
 import os
 import io
@@ -17,12 +18,10 @@ from difflib import SequenceMatcher
 from itertools import combinations
 from datetime import datetime
 
-
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig, frame):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
     os._exit(1)
-
 
 signal.signal(signal.SIGINT, force_terminal_exit)
 if hasattr(signal, "SIGBREAK"):
@@ -31,7 +30,6 @@ if hasattr(signal, "SIGBREAK"):
 warnings.filterwarnings("ignore")
 try:
     from cryptography.utils import CryptographyDeprecationWarning
-
     warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 except ImportError:
     pass
@@ -157,7 +155,7 @@ def get_unprocessed_rules_from_db(logger):
                     conn.commit()
 
                     query = """
-                        SELECT DISTINCT pr.id, pr.name, pr.content, pr.created_at, pr.created_by
+                        SELECT DISTINCT pr.id, pr.name, pr.content, pr.created_at, pr.created_by, COALESCE(pr.updated_at, pr.created_at) AS updated_at
                         FROM public.process_rule pr
                         JOIN public.map_rule_association mra ON pr.id = mra.process_rule_id
                         WHERE pr.deleted_at IS NULL
@@ -234,11 +232,8 @@ def lock_rules_in_ledger(rule_group_map: dict, db_user: str, logger):
 
 class SkeletonMapper(ast.NodeTransformer):
     def visit_Name(self, n): return ast.copy_location(ast.Name('v', n.ctx), n)
-
     def visit_Constant(self, n): return ast.copy_location(ast.Constant('c'), n)
-
     def visit_FunctionDef(self, n): n.name = 'f'; self.generic_visit(n); return n
-
     def visit_AsyncFunctionDef(self, n): n.name = 'f'; self.generic_visit(n); return n
 
 
@@ -293,7 +288,8 @@ def run_grouping_and_comparison(limit: int, name_threshold: float, code_threshol
     logger.info(f"Found {len(groups)} total unanalysed groups. Processing top {limit} groups.")
     groups_to_process = groups[:limit]
 
-    rule_metadata_map = {r[1]: (r[0], r[3], r[4]) for r in all_data}
+    # Map rule_name -> (id, created_at, created_by, updated_at)
+    rule_metadata_map = {r[1]: (r[0], r[3], r[4], r[5]) for r in all_data}
     rule_content_map = {r[1]: r[2] for r in all_data}
 
     csv_rows = []
@@ -310,7 +306,7 @@ def run_grouping_and_comparison(limit: int, name_threshold: float, code_threshol
             rule_to_folder_map[rule_name] = folder_name
             if rule_name in rule_metadata_map:
                 meta = rule_metadata_map[rule_name]
-                csv_rows.append((i, meta[0], rule_name, meta[1], meta[2]))
+                csv_rows.append((i, meta[0], rule_name, meta[1], meta[2], meta[3]))
 
             file_path = group_dir / f"{rule_name}.py"
             file_path.write_text(rule_content_map.get(rule_name, "# Content unavailable"), encoding="utf-8")
@@ -320,7 +316,7 @@ def run_grouping_and_comparison(limit: int, name_threshold: float, code_threshol
     rule_info_path = temp_dir / "rule_info.csv"
     with open(rule_info_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["group_id", "id", "name", "created_at", "created_by"])
+        writer.writerow(["group_id", "id", "name", "created_at", "created_by", "updated_at"])
         writer.writerows(sorted(csv_rows, key=lambda x: (x[0], x[2])))
     logger.info(f"Wrote rule metadata to '{rule_info_path}'.")
 

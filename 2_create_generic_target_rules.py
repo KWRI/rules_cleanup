@@ -1,8 +1,12 @@
 """
 Pre-processes identical rule clusters by deriving generic target rule names.
+Implements multi-tier candidate scoring:
+  1. Priority 1: Already standardized generic rule (PascalCase / Phase 2)
+  2. Priority 2: Most recently maintained rule (latest updated_at)
+  3. Priority 3: Fallback to oldest created_at
+
 Performs CASE-INSENSITIVE DB checks and 100% AST logic identity verification.
-If an existing generic rule name exists (regardless of ID vs Id capitalization) with DIFFERENT logic,
-increments version suffixes (e.g., ListStatusIdV1, ListStatusIdV2) and registers the new versioned generic rule via API.
+Registers versioned generic rules via API if logic differs from existing DB definitions.
 
 Outputs: temp-data/resolved_generic_targets.csv
 """
@@ -19,6 +23,7 @@ import warnings
 import ast
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime
 
 
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
@@ -56,11 +61,8 @@ def setup_logger():
 
 class SkeletonMapper(ast.NodeTransformer):
     def visit_Name(self, n): return ast.copy_location(ast.Name('v', n.ctx), n)
-
     def visit_Constant(self, n): return ast.copy_location(ast.Constant('c'), n)
-
     def visit_FunctionDef(self, n): n.name = 'f'; self.generic_visit(n); return n
-
     def visit_AsyncFunctionDef(self, n): n.name = 'f'; self.generic_visit(n); return n
 
 
@@ -85,11 +87,20 @@ def are_ast_structures_identical(source1: str, source2: str) -> bool:
     return (s1 is not None) and (s1 == s2)
 
 
+def is_already_standardized_generic(name: str) -> bool:
+    """Returns True if the rule name is already standardized (PascalCase, no numeric MLS prefix)."""
+    base = name.removesuffix(".py")
+    if re.match(r"^\d+", base):
+        return False
+    if base.endswith("ID"):
+        return False
+    return bool(re.match(r"^[A-Z][a-zA-Z0-9]*$", base))
+
+
 def to_pascal_case(name: str) -> str:
     base_name = name.removesuffix(".py")
     base_name = re.sub(r"[\(\)\[\]\{\}]", "", base_name)
     base_name = re.sub(r"[/|\\]|__", " ", base_name)
-    # Fix trailing capital ID -> Id
     if base_name.endswith("ID"):
         base_name = base_name[:-2] + "Id"
     words = re.split(r"[\s_-]+", base_name)
@@ -110,7 +121,7 @@ def to_pascal_case(name: str) -> str:
 
 
 def strip_numeric_prefix(name: str) -> str:
-    """Strips leading numeric MLS prefixes and standardizes to PascalCase (e.g., '491ListStatusID' -> 'ListStatusId')."""
+    """Strips leading numeric MLS prefixes and standardizes to PascalCase."""
     base = name.removesuffix(".py")
     cleaned = re.sub(r"^\d+", "", base)
     return to_pascal_case(cleaned if cleaned else base)
@@ -144,26 +155,66 @@ def get_db_connection_params():
     return ssh_host, ssh_user, ssh_key_path, ssh_passphrase, db_host, db_name, db_user, db_pass
 
 
-def get_existing_db_rules_with_content(logger: logging.Logger) -> dict:
-    """Returns mapping of lowercase_name -> (actual_db_name, content)."""
+def get_existing_db_rules_with_metadata(logger: logging.Logger) -> dict:
+    """Returns mapping of lowercase_name -> (actual_db_name, content, updated_at, created_at)."""
     ssh_host, ssh_user, ssh_key_path, ssh_passphrase, db_host, db_name, db_user, db_pass = get_db_connection_params()
     existing_rules = {}
     try:
         pkey = load_ssh_pkey(ssh_key_path, ssh_passphrase)
-        logger.info("Connecting to DB to query existing active rule content...")
+        logger.info("Connecting to DB to query existing active rule content and timestamps...")
         with SSHTunnelForwarder((ssh_host, 22), ssh_username=ssh_user, ssh_pkey=pkey,
                                 remote_bind_address=(db_host, 5432)) as tunnel:
             with psycopg2.connect(dbname=db_name, user=db_user, password=db_pass, host="127.0.0.1",
                                   port=tunnel.local_bind_port) as conn:
                 with conn.cursor() as cur:
-                    query = "SELECT name, content FROM public.process_rule WHERE deleted_at IS NULL;"
+                    query = """
+                        SELECT name, content, COALESCE(updated_at, created_at) AS updated_at, created_at 
+                        FROM public.process_rule 
+                        WHERE deleted_at IS NULL;
+                    """
                     cur.execute(query)
-                    for r_name, r_content in cur.fetchall():
-                        # Key by lower case for case-insensitive lookup
-                        existing_rules[r_name.lower()] = (r_name, r_content or "")
+                    for r_name, r_content, r_updated, r_created in cur.fetchall():
+                        existing_rules[r_name.lower()] = (r_name, r_content or "", r_updated, r_created)
     except Exception as e:
         logger.error(f"Database error while fetching existing rules: {e}", exc_info=True)
     return existing_rules
+
+
+def select_best_candidate_rule(rules: set, existing_rules_lower: dict) -> tuple[str, str]:
+    """
+    Ranks rule candidates within an AST-identical cluster.
+    Priority 1: Already standardized generic rule (PascalCase)
+    Priority 2: Most recently updated rule (latest updated_at)
+    Priority 3: Fallback to oldest created_at
+    """
+    scored_candidates = []
+
+    for rule_name in rules:
+        meta = existing_rules_lower.get(rule_name.lower())
+        is_std = is_already_standardized_generic(rule_name)
+
+        if meta:
+            updated_at = meta[2] or datetime.min
+            created_at = meta[3] or datetime.max
+        else:
+            updated_at = datetime.min
+            created_at = datetime.max
+
+        created_ts = created_at.timestamp() if isinstance(created_at, datetime) else 0.0
+
+        # Preference Tuple: (Priority 1, Priority 2, Priority 3)
+        score = (
+            1 if is_std else 0,
+            updated_at,
+            -created_ts
+        )
+
+        reason = "ALREADY_GENERIC" if is_std else "MOST_RECENTLY_UPDATED"
+        scored_candidates.append((score, rule_name, reason, updated_at))
+
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+    best_match = scored_candidates[0]
+    return best_match[1], best_match[2]
 
 
 def register_generic_rule_via_microservice(source_rule_name: str, generic_target_name: str,
@@ -244,7 +295,7 @@ def resolve_generic_targets():
     comparison_report_path = temp_dir / "comparison_report.csv"
 
     if not comparison_report_path.exists():
-        logger.error(f"Missing {comparison_report_path}. Run group_similar_rules.py first.")
+        logger.error(f"Missing {comparison_report_path}. Run 1_group_similar_rules.py first.")
         return
 
     identical_groups = defaultdict(set)
@@ -259,36 +310,34 @@ def resolve_generic_targets():
         logger.info("No 'Identical' rule clusters found in comparison report.")
         return
 
-    existing_rules_lower = get_existing_db_rules_with_content(logger)
+    existing_rules_lower = get_existing_db_rules_with_metadata(logger)
     resolved_mapping = {}
 
     for group_folder, rules in identical_groups.items():
-        base_candidate = min(rules, key=len)
-        candidate_file_path = temp_dir / group_folder / f"{base_candidate}.py"
+        selected_candidate, selection_reason = select_best_candidate_rule(rules, existing_rules_lower)
 
+        candidate_file_path = temp_dir / group_folder / f"{selected_candidate}.py"
         if candidate_file_path.exists():
             candidate_code = candidate_file_path.read_text(encoding="utf-8")
         else:
-            _, candidate_code = existing_rules_lower.get(base_candidate.lower(), ("", ""))
+            _, candidate_code, _, _ = existing_rules_lower.get(selected_candidate.lower(), ("", "", None, None))
 
-        base_generic_name = strip_numeric_prefix(base_candidate)
+        base_generic_name = strip_numeric_prefix(selected_candidate)
         target_name = base_generic_name
 
-        # Case-insensitive check in DB
         if target_name.lower() in existing_rules_lower:
-            actual_db_name, db_code = existing_rules_lower[target_name.lower()]
+            actual_db_name, db_code, _, _ = existing_rules_lower[target_name.lower()]
 
             if are_ast_structures_identical(candidate_code, db_code):
                 logger.info(
-                    f"Group '{group_folder}' -> Generic rule '{actual_db_name}' exists with 100% MATCHING logic. Reusing '{actual_db_name}'.")
+                    f"Group '{group_folder}' -> Selected candidate '{selected_candidate}' ({selection_reason}). Generic rule '{actual_db_name}' exists with 100% MATCHING logic.")
                 target_name = actual_db_name
             else:
-                # Logic differs! Force version increment ListStatusIdV1, ListStatusIdV2...
                 version = 1
                 versioned_target = f"{base_generic_name}V{version}"
 
                 while versioned_target.lower() in existing_rules_lower:
-                    actual_v_name, v_code = existing_rules_lower[versioned_target.lower()]
+                    actual_v_name, v_code, _, _ = existing_rules_lower[versioned_target.lower()]
                     if are_ast_structures_identical(candidate_code, v_code):
                         versioned_target = actual_v_name
                         break
@@ -300,23 +349,22 @@ def resolve_generic_targets():
                 if target_name.lower() not in existing_rules_lower:
                     logger.info(
                         f"Group '{group_folder}' -> Existing base generic rule code differed. Registering new versioned rule '{target_name}'...")
-                    register_generic_rule_via_microservice(base_candidate, target_name, logger)
-                    existing_rules_lower[target_name.lower()] = (target_name, candidate_code)
+                    register_generic_rule_via_microservice(selected_candidate, target_name, logger)
+                    existing_rules_lower[target_name.lower()] = (target_name, candidate_code, datetime.now(), datetime.now())
         else:
-            # Base generic rule does not exist at all -> Register it via API
             logger.info(
-                f"Group '{group_folder}' -> Base generic rule '{target_name}' missing from DB. Registering via API...")
-            register_generic_rule_via_microservice(base_candidate, target_name, logger)
-            existing_rules_lower[target_name.lower()] = (target_name, candidate_code)
+                f"Group '{group_folder}' -> Selected candidate '{selected_candidate}' ({selection_reason}). Base generic rule '{target_name}' missing from DB. Registering via API...")
+            register_generic_rule_via_microservice(selected_candidate, target_name, logger)
+            existing_rules_lower[target_name.lower()] = (target_name, candidate_code, datetime.now(), datetime.now())
 
-        resolved_mapping[group_folder] = target_name
+        resolved_mapping[group_folder] = (target_name, selected_candidate, selection_reason)
 
     out_csv = temp_dir / "resolved_generic_targets.csv"
     with open(out_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["group_folder", "resolved_generic_target"])
-        for group_folder, generic_target in resolved_mapping.items():
-            writer.writerow([group_folder, generic_target])
+        writer.writerow(["group_folder", "resolved_generic_target", "source_candidate", "selection_reason"])
+        for group_folder, (generic_target, src_cand, reason) in resolved_mapping.items():
+            writer.writerow([group_folder, generic_target, src_cand, reason])
 
     logger.info(f"Generated '{out_csv}' with {len(resolved_mapping)} resolved generic rule targets.")
     logger.info("--- Generic Target Rule Pre-processing Finished ---")

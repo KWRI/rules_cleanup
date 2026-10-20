@@ -1,6 +1,7 @@
 """
 Create Migration Batch for Identical Rules.
 Uses resolved generic target rules to build consolidation manifests and target MLS feed CSVs.
+Includes selection reason and target generic names in consolidation_blueprint.csv.
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -157,8 +158,13 @@ def create_batch():
         logger.error("Required pre-processing files missing in temp-data/. Run 2_create_generic_target_rules.py first.")
         return
 
-    generic_targets_map = {row['group_folder']: row['resolved_generic_target']
-                           for row in csv.DictReader(generic_targets_path.open(encoding='utf-8'))}
+    generic_targets_map = {}
+    selection_reasons = {}
+    with open(generic_targets_path, 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            folder = row['group_folder']
+            generic_targets_map[folder] = row['resolved_generic_target']
+            selection_reasons[folder] = row.get('selection_reason', 'AUTOMATIC')
 
     identical_groups = defaultdict(set)
     with open(comparison_report_path, 'r', encoding='utf-8') as f:
@@ -173,6 +179,7 @@ def create_batch():
         return
 
     consolidation_map = {}
+    consolidation_reasons = {}
     safe_to_delete_list = []
 
     all_rules = list({rule for group in identical_groups.values() for rule in group})
@@ -180,6 +187,7 @@ def create_batch():
 
     for group_folder, rules in identical_groups.items():
         generic_target = generic_targets_map.get(group_folder)
+        reason = selection_reasons.get(group_folder, 'AUTOMATIC')
         if not generic_target:
             continue
 
@@ -192,13 +200,15 @@ def create_batch():
                 safe_to_delete_list.append(dup_rule)
             else:
                 consolidation_map[dup_rule] = generic_target
+                consolidation_reasons[dup_rule] = reason
 
     blueprint_path = temp_dir / "consolidation_blueprint.csv"
     with open(blueprint_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["old_name", "target_new_name"])
+        writer.writerow(["old_name", "target_new_name", "generic_rule_name", "selection_reason"])
         for old, new in consolidation_map.items():
-            writer.writerow([old, new])
+            r_reason = consolidation_reasons.get(old, 'AUTOMATIC')
+            writer.writerow([old, new, new, r_reason])
     logger.info(f"Generated 'consolidation_blueprint.csv' with {len(consolidation_map)} active duplicate mappings.")
 
     batch_target_path = temp_dir / "batch_mls_targets.csv"
