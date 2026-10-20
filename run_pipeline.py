@@ -2,7 +2,8 @@
 Master Migration Pipeline Orchestrator.
 
 Sequentially executes Stages 1 through 11 with built-in error handling,
-dry-run verification gates, timing pause prompts, and user confirmation steps.
+preview safety review gates, dry-run verification steps, timing pause prompts,
+and user confirmation steps.
 
 Usage:
     python run_pipeline.py                               # Interactive mode (default AST limit: 9999)
@@ -97,9 +98,19 @@ def main() -> None:
         sys.exit(1)
 
     # ------------------------------------------------------------
-    # STAGE 2: Standardize Generic Names & Register Missing Rules via API
+    # STAGE 2: Standardize Generic Target Names & Register Missing Rules via API
     # ------------------------------------------------------------
+    # Pass A: Preview Mode (Generates resolved_generic_targets.csv without DB mutations)
     if not run_stage("2_create_generic_target_rules.py"):
+        sys.exit(1)
+
+    if not args.auto_approve:
+        if not prompt_user_confirmation("Stage 2 Preview complete. Inspect 'temp-data/resolved_generic_targets.csv'. Proceed with Rule Creation (--do-creation)?"):
+            logger.warning("Pipeline paused by user prior to Stage 2 rule creation.")
+            sys.exit(0)
+
+    # Pass B: Execution Mode (Creates new generic rules via Microservice API)
+    if not run_stage("2_create_generic_target_rules.py", ["--do-creation"]):
         sys.exit(1)
 
     # ------------------------------------------------------------

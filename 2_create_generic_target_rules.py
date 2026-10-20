@@ -6,10 +6,12 @@ Implements multi-tier candidate scoring:
   3. Priority 3: Fallback to oldest created_at
 
 Performs CASE-INSENSITIVE DB checks and 100% AST logic identity verification.
-Registers versioned generic rules via API if logic differs from existing DB definitions.
 
-Outputs: temp-data/resolved_generic_targets.csv
+Modes:
+  python 2_create_generic_target_rules.py               # DEFAULT: Preview mode (Generates CSV preview ONLY)
+  python 2_create_generic_target_rules.py --do-creation # EXECUTE: Creates new rules via API from reviewed CSV
 """
+
 import os
 import io
 import sys
@@ -18,6 +20,7 @@ import re
 import signal
 import logging
 import time
+import argparse
 import requests
 import warnings
 import ast
@@ -25,12 +28,10 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 
-
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig=None, frame=None):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
     os._exit(1)
-
 
 signal.signal(signal.SIGINT, force_terminal_exit)
 if hasattr(signal, "SIGBREAK"):
@@ -88,7 +89,7 @@ def are_ast_structures_identical(source1: str, source2: str) -> bool:
 
 
 def is_already_standardized_generic(name: str) -> bool:
-    """Returns True if the rule name is already standardized (PascalCase, no numeric MLS prefix)."""
+    """Returns True if rule name is already standardized (PascalCase, no numeric MLS prefix)."""
     base = name.removesuffix(".py")
     if re.match(r"^\d+", base):
         return False
@@ -121,7 +122,6 @@ def to_pascal_case(name: str) -> str:
 
 
 def strip_numeric_prefix(name: str) -> str:
-    """Strips leading numeric MLS prefixes and standardizes to PascalCase."""
     base = name.removesuffix(".py")
     cleaned = re.sub(r"^\d+", "", base)
     return to_pascal_case(cleaned if cleaned else base)
@@ -156,7 +156,6 @@ def get_db_connection_params():
 
 
 def get_existing_db_rules_with_metadata(logger: logging.Logger) -> dict:
-    """Returns mapping of lowercase_name -> (actual_db_name, content, updated_at, created_at)."""
     ssh_host, ssh_user, ssh_key_path, ssh_passphrase, db_host, db_name, db_user, db_pass = get_db_connection_params()
     existing_rules = {}
     try:
@@ -181,12 +180,6 @@ def get_existing_db_rules_with_metadata(logger: logging.Logger) -> dict:
 
 
 def select_best_candidate_rule(rules: set, existing_rules_lower: dict) -> tuple[str, str]:
-    """
-    Ranks rule candidates within an AST-identical cluster.
-    Priority 1: Already standardized generic rule (PascalCase)
-    Priority 2: Most recently updated rule (latest updated_at)
-    Priority 3: Fallback to oldest created_at
-    """
     scored_candidates = []
 
     for rule_name in rules:
@@ -202,7 +195,6 @@ def select_best_candidate_rule(rules: set, existing_rules_lower: dict) -> tuple[
 
         created_ts = created_at.timestamp() if isinstance(created_at, datetime) else 0.0
 
-        # Preference Tuple: (Priority 1, Priority 2, Priority 3)
         score = (
             1 if is_std else 0,
             updated_at,
@@ -221,8 +213,7 @@ def register_generic_rule_via_microservice(source_rule_name: str, generic_target
                                            logger: logging.Logger) -> bool:
     load_dotenv()
     api_key = os.getenv("MLS_ADMIN_API_KEY", "").strip().strip("'\"")
-    stage_url = os.getenv("MLS_ADMIN_STAGE_URL", "https://stage-ext-ms.data.kw.com/v1/mls-admin").strip().strip(
-        "'\"").rstrip("/")
+    stage_url = os.getenv("MLS_ADMIN_STAGE_URL", "https://stage-ext-ms.data.kw.com/v1/mls-admin").strip().strip("'\"").rstrip("/")
     rules_endpoint = f"{stage_url}/rules"
 
     if not api_key:
@@ -271,8 +262,7 @@ def register_generic_rule_via_microservice(source_rule_name: str, generic_target
                     for attempt in range(1, 4):
                         res = requests.post(rules_endpoint, json=payload, headers=headers, timeout=30)
                         if res.status_code in [200, 201]:
-                            logger.info(
-                                f"✨ Registered new generic rule '{generic_target_name}' via API | ID: {res.json().get('id')}")
+                            logger.info(f"✨ Created new generic rule '{generic_target_name}' via API | ID: {res.json().get('id')}")
                             return True
                         elif res.status_code == 409 or "already exists" in res.text.lower():
                             logger.info(f"ℹ️ Generic rule '{generic_target_name}' already exists in DB.")
@@ -281,19 +271,49 @@ def register_generic_rule_via_microservice(source_rule_name: str, generic_target
                             time.sleep(attempt * 2)
                             continue
                         else:
-                            logger.error(f"Failed to register '{generic_target_name}' [{res.status_code}]: {res.text}")
+                            logger.error(f"Failed to create '{generic_target_name}' [{res.status_code}]: {res.text}")
                             return False
     except Exception as e:
-        logger.error(f"Error registering generic rule '{generic_target_name}': {e}", exc_info=True)
+        logger.error(f"Error creating generic rule '{generic_target_name}': {e}", exc_info=True)
         return False
 
 
-def resolve_generic_targets():
+def resolve_generic_targets(do_creation: bool = False):
     logger = setup_logger()
-    logger.info("--- Starting Generic Target Rule Pre-processing ---")
+    logger.info("============================================================")
+    if do_creation:
+        logger.info("🚀 STAGE 2: EXECUTION MODE (CREATING TARGET RULES VIA API)")
+    else:
+        logger.info("🔍 STAGE 2: PREVIEW MODE (GENERATING PREVIEW CSV - NO DB MUTATION)")
+    logger.info("============================================================")
+
     temp_dir = Path("temp-data")
     comparison_report_path = temp_dir / "comparison_report.csv"
+    out_csv = temp_dir / "resolved_generic_targets.csv"
 
+    # --- EXECUTION MODE: Read reviewed CSV and create pending rules ---
+    if do_creation:
+        if not out_csv.exists():
+            logger.error(f"❌ Missing '{out_csv}'. Run Stage 2 in preview mode first.")
+            return
+
+        created_count = 0
+        with open(out_csv, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                action = row.get("action", "")
+                src_cand = row.get("source_candidate", "")
+                target_name = row.get("resolved_generic_target", "")
+
+                if action == "CREATE_NEW" and src_cand and target_name:
+                    logger.info(f"Creating generic rule '{target_name}' (source: '{src_cand}')...")
+                    if register_generic_rule_via_microservice(src_cand, target_name, logger):
+                        created_count += 1
+
+        logger.info(f"✅ Executed rule creation pass: Successfully created {created_count} generic rule(s) via API.")
+        return
+
+    # --- PREVIEW MODE: Generate resolved_generic_targets.csv WITHOUT API Calls ---
     if not comparison_report_path.exists():
         logger.error(f"Missing {comparison_report_path}. Run 1_group_similar_rules.py first.")
         return
@@ -324,14 +344,17 @@ def resolve_generic_targets():
 
         base_generic_name = strip_numeric_prefix(selected_candidate)
         target_name = base_generic_name
+        action = "REUSE_EXISTING"
 
         if target_name.lower() in existing_rules_lower:
             actual_db_name, db_code, _, _ = existing_rules_lower[target_name.lower()]
 
             if are_ast_structures_identical(candidate_code, db_code):
                 logger.info(
-                    f"Group '{group_folder}' -> Selected candidate '{selected_candidate}' ({selection_reason}). Generic rule '{actual_db_name}' exists with 100% MATCHING logic.")
+                    f"Group '{group_folder}' -> Selected candidate '{selected_candidate}' ({selection_reason}). Generic rule '{actual_db_name}' EXISTS with 100% MATCHING logic."
+                )
                 target_name = actual_db_name
+                action = "REUSE_EXISTING"
             else:
                 version = 1
                 versioned_target = f"{base_generic_name}V{version}"
@@ -340,38 +363,45 @@ def resolve_generic_targets():
                     actual_v_name, v_code, _, _ = existing_rules_lower[versioned_target.lower()]
                     if are_ast_structures_identical(candidate_code, v_code):
                         versioned_target = actual_v_name
+                        action = "REUSE_EXISTING"
                         break
                     version += 1
                     versioned_target = f"{base_generic_name}V{version}"
 
                 target_name = versioned_target
-
                 if target_name.lower() not in existing_rules_lower:
+                    action = "CREATE_NEW"
                     logger.info(
-                        f"Group '{group_folder}' -> Existing base generic rule code differed. Registering new versioned rule '{target_name}'...")
-                    register_generic_rule_via_microservice(selected_candidate, target_name, logger)
-                    existing_rules_lower[target_name.lower()] = (target_name, candidate_code, datetime.now(), datetime.now())
+                        f"Group '{group_folder}' -> Code differed. Proposed NEW versioned rule '{target_name}' (Action: {action})"
+                    )
         else:
+            action = "CREATE_NEW"
             logger.info(
-                f"Group '{group_folder}' -> Selected candidate '{selected_candidate}' ({selection_reason}). Base generic rule '{target_name}' missing from DB. Registering via API...")
-            register_generic_rule_via_microservice(selected_candidate, target_name, logger)
-            existing_rules_lower[target_name.lower()] = (target_name, candidate_code, datetime.now(), datetime.now())
+                f"Group '{group_folder}' -> Proposed NEW base generic rule '{target_name}' (Action: {action})"
+            )
 
-        resolved_mapping[group_folder] = (target_name, selected_candidate, selection_reason)
+        resolved_mapping[group_folder] = (target_name, selected_candidate, selection_reason, action)
 
-    out_csv = temp_dir / "resolved_generic_targets.csv"
     with open(out_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["group_folder", "resolved_generic_target", "source_candidate", "selection_reason"])
-        for group_folder, (generic_target, src_cand, reason) in resolved_mapping.items():
-            writer.writerow([group_folder, generic_target, src_cand, reason])
+        writer.writerow(["group_folder", "resolved_generic_target", "source_candidate", "selection_reason", "action"])
+        for group_folder, (generic_target, src_cand, reason, act) in resolved_mapping.items():
+            writer.writerow([group_folder, generic_target, src_cand, reason, act])
 
-    logger.info(f"Generated '{out_csv}' with {len(resolved_mapping)} resolved generic rule targets.")
-    logger.info("--- Generic Target Rule Pre-processing Finished ---")
+    logger.info("============================================================")
+    logger.info(f"📋 PREVIEW GENERATED: '{out_csv}' ({len(resolved_mapping)} targets).")
+    logger.info("   Review the CSV file and candidate Python code files in 'temp-data/'.")
+    logger.info("   When ready, execute creation with:")
+    logger.info("   python 2_create_generic_target_rules.py --do-creation")
+    logger.info("============================================================")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Stage 2 Generic Target Resolver with Preview Safety Gate")
+    parser.add_argument("--do-creation", action="store_true", help="Executes API rule creation for pending rules")
+    args = parser.parse_args()
+
     try:
-        resolve_generic_targets()
+        resolve_generic_targets(do_creation=args.do_creation)
     except (KeyboardInterrupt, SystemExit):
         force_terminal_exit()
