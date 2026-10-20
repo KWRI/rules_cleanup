@@ -1,11 +1,11 @@
 """
-Pipeline Stage 7: Bulk Production Promotion Engine.
+Pipeline Stage 7: Bulk Production Promotion Engine & Slack Draft Generator.
 
 Promotes newly standardized rules, schema maps, and metadata to the Production environment:
-1. Reads active target numeric MLS IDs directly from 'temp-data/promotion_sources.txt'
-   (or automatically builds it from Stage 4 targets if missing).
-2. Stages the manifest file on the remote deployment server over SFTP.
-3. Invokes an interactive SSH shell to execute remote promotion commands ('s_p',
+1. Reads target numeric MLS IDs directly from 'temp-data/promotion_sources.txt' (or auto-builds it).
+2. Generates a formatted Slack promotion notification message and copies it to the clipboard.
+3. Stages the manifest file on the remote deployment server over SFTP using a user-specific filename.
+4. Invokes an interactive SSH shell to execute remote promotion commands ('s_p',
    'set_promotion stage prod', and 'promote_source.py').
 
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
@@ -76,9 +76,11 @@ SSH_HOST = (os.getenv("REMOTE_SSH_HOST") or os.getenv("REMOTE_HOST", "sdh.data.k
 SSH_USER = (os.getenv("REMOTE_SSH_USER") or os.getenv("SSH_USER", "")).strip("'\"")
 SSH_KEY_PATH = (os.getenv("REMOTE_SSH_KEY_PATH") or os.getenv("SSH_KEY_PATH", "")).strip("'\"")
 SSH_PASSPHRASE = (os.getenv("REMOTE_SSH_KEY_PASSPHRASE") or os.getenv("SSH_KEY_PASSPHRASE", "")).strip("'\"")
+
+# User-specific remote manifest path to prevent permission collisions on shared infrastructure
 REMOTE_MANIFEST_PATH = os.getenv(
     "REMOTE_MANIFEST_PATH",
-    "/eim-mls-admin-ms/devtools/source_promotion/promotion_sources.txt"
+    f"/eim-mls-admin-ms/devtools/source_promotion/promotion_sources_{SSH_USER}.txt" if SSH_USER else "/eim-mls-admin-ms/devtools/source_promotion/promotion_sources.txt"
 )
 
 
@@ -108,17 +110,6 @@ def ensure_promotion_manifest(temp_data_dir: Path) -> Path:
                     if mls_id.isdigit():
                         target_ids.add(int(mls_id))
 
-    # 3. Fallback: Parse batch_mls_targets.csv
-    if not target_ids:
-        batch_csv = temp_data_dir / "batch_mls_targets.csv"
-        if batch_csv.exists():
-            with open(batch_csv, mode="r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    mls_id = row.get("mls_id", "").strip()
-                    if mls_id.isdigit():
-                        target_ids.add(int(mls_id))
-
     # Output verified sorted manifest
     if target_ids:
         sorted_ids = sorted(list(target_ids))
@@ -141,7 +132,6 @@ def get_target_mls_ids(manifest_path: Path) -> list[int]:
     with open(manifest_path, "r", encoding="utf-8") as f:
         ids = [int(line.strip()) for line in f if line.strip().isdigit()]
 
-    # Preserve order while deduplicating
     seen = set()
     unique_ids = []
     for source_id in ids:
@@ -168,7 +158,16 @@ def main() -> None:
     logger.info(f"🎯 [PROMOTION BATCH GUARD] Target MLS IDs loaded from manifest ({len(mls_ids)}): {mls_ids}")
 
     # ------------------------------------------------------------
-    # 1. SFTP MANIFEST STAGING
+    # 1. DRAFT SLACK NOTIFICATION & COPY TO CLIPBOARD
+    # ------------------------------------------------------------
+    try:
+        from draft_slack_message import draft_slack_message
+        draft_slack_message()
+    except Exception as err:
+        logger.warning(f"⚠️ Slack draft generator skipped: {err}")
+
+    # ------------------------------------------------------------
+    # 2. SFTP MANIFEST STAGING
     # ------------------------------------------------------------
     logger.info("============================================================")
     logger.info("📦 STAGING PROMOTION MANIFEST ON REMOTE DEPLOYMENT SERVER")
@@ -197,7 +196,7 @@ def main() -> None:
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(hostname=SSH_HOST, username=SSH_USER, pkey=ssh_key, timeout=15)
 
-        logger.info(f"[2/4] Uploading manifest to server path: {REMOTE_MANIFEST_PATH}...")
+        logger.info(f"[2/4] Uploading manifest to user remote path: {REMOTE_MANIFEST_PATH}...")
         sftp = ssh.open_sftp()
         sftp.put(str(local_manifest), REMOTE_MANIFEST_PATH)
         sftp.close()
@@ -212,7 +211,7 @@ def main() -> None:
             logger.info(f"   Targeted MLS ID: {source_id}")
 
         # ------------------------------------------------------------
-        # 2. INTERACTIVE SHELL PROMOTION SEQUENCE
+        # 3. INTERACTIVE SHELL PROMOTION SEQUENCE
         # ------------------------------------------------------------
         logger.info("[4/4] Invoking production rule migration engine sequentially...")
         shell = ssh.invoke_shell()
@@ -230,8 +229,8 @@ def main() -> None:
                     if line.strip():
                         logger.info(f"[REMOTE SHELL] {line}")
 
-        # Send execution loop
-        loop_cmd = f'while IFS= read -r i; do echo "Processing ID: "$i; python promote_source.py -s process "$i" -y; done < {REMOTE_MANIFEST_PATH}'
+        # Send execution loop using remote user manifest path
+        loop_cmd = f'tr -d "\\r" < {REMOTE_MANIFEST_PATH} | while IFS= read -r i; do [ -n "$i" ] && echo "Processing ID: "$i && python promote_source.py -s process "$i" -y; done'
         logger.info(f"[INPUT] Sending batch promotion loop: {loop_cmd}")
         shell.send(loop_cmd + "\n")
 

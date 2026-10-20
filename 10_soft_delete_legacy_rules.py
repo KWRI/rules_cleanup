@@ -1,7 +1,11 @@
 """
-Pipeline Stage 10: Multi-Environment Legacy Rule Soft-Deletion Engine (Interactive & Gated).
+Pipeline Stage 10: Multi-Environment Legacy Rule Soft-Deletion Engine (Interactive & Environment-Aware).
 
-Verifies UI process map dependencies across both Staging and Production databases first.
+Verifies UI process map dependencies across both Staging and Production databases independently.
+Handles cases where Staging and Production process maps differ:
+  - STAGE soft-deletes rules that have 0 references in Staging.
+  - PROD soft-deletes rules that have 0 references in Production.
+
 Prompts sequentially: Stage soft-deletion happens FIRST.
 If Stage fails or is skipped, Production soft-deletion is AUTOMATICALLY SKIPPED for safety.
 
@@ -247,57 +251,73 @@ def main() -> None:
     logger.info("\n🔍 Step 2/2: Checking Production DB active map dependencies...")
     prod_counts = get_active_rule_usage_counts_db("PROD", legacy_candidates)
 
-    rules_to_delete = []
-    rules_retained = []
+    # Filter candidates per environment based on process map references
+    stage_rules_to_delete = [name for name in legacy_candidates if stage_counts.get(name, 0) == 0]
+    prod_rules_to_delete = [name for name in legacy_candidates if prod_counts.get(name, 0) == 0]
 
-    for name in legacy_candidates:
-        s_refs = stage_counts.get(name, 0)
-        p_refs = prod_counts.get(name, 0)
+    # Log Stage status
+    stage_retained = [(name, stage_counts[name]) for name in legacy_candidates if stage_counts.get(name, 0) > 0]
+    if stage_retained:
+        logger.info(f"\n⚠️ [STAGE] Retaining {len(stage_retained)} rule(s) referenced by active Staging maps:")
+        for name, refs in stage_retained:
+            logger.info(f"   • '{name}' -> Active Stage References: {refs} (SKIPPED ON STAGE)")
 
-        if s_refs > 0 or p_refs > 0:
-            rules_retained.append((name, s_refs, p_refs))
-        else:
-            rules_to_delete.append(name)
+    # Log Prod status
+    prod_retained = [(name, prod_counts[name]) for name in legacy_candidates if prod_counts.get(name, 0) > 0]
+    if prod_retained:
+        logger.info(f"\n⚠️ [PROD] Retaining {len(prod_retained)} rule(s) referenced by active Production maps:")
+        for name, refs in prod_retained:
+            logger.info(f"   • '{name}' -> Active Prod References: {refs} (SKIPPED ON PROD)")
 
-    if rules_retained:
-        logger.info(
-            f"\n⚠️ Retaining {len(rules_retained)} rule(s) because they are still referenced by active UI maps:")
-        for name, s_refs, p_refs in rules_retained:
-            logger.info(f"   • '{name}' -> Active References: Stage={s_refs}, Prod={p_refs} (SKIPPED)")
-
-    if not rules_to_delete:
-        logger.info("\n🎉 No legacy rules are ready for soft-deletion (all candidates are still in active use).")
+    if not stage_rules_to_delete and not prod_rules_to_delete:
+        logger.info("\n🎉 No legacy rules are ready for soft-deletion in either environment.")
         return
-
-    logger.info(f"\n✅ Verified {len(rules_to_delete)} fully unlinked legacy rule(s) ready for soft-deletion:")
-    for idx, name in enumerate(rules_to_delete, 1):
-        logger.info(f"   {idx}. {name}")
 
     # --- INTERACTIVE PROMPT 1: STAGE ---
     print("\n" + "=" * 60)
-    stage_confirm = input(
-        f"Do you want to soft-delete these {len(rules_to_delete)} legacy rule(s) on STAGE? (yes/no): ").strip().lower()
-
     stage_success = False
-    if stage_confirm in ["yes", "y"]:
-        stage_success = execute_deletion_pass("STAGE", rules_to_delete)
+
+    if stage_rules_to_delete:
+        logger.info(f"✅ Verified {len(stage_rules_to_delete)} unlinked legacy rule(s) ready for soft-deletion on STAGE:")
+        for idx, name in enumerate(stage_rules_to_delete, 1):
+            logger.info(f"   {idx}. {name}")
+
+        stage_confirm = input(
+            f"\nDo you want to soft-delete these {len(stage_rules_to_delete)} legacy rule(s) on STAGE? (yes/no): "
+        ).strip().lower()
+
+        if stage_confirm in ["yes", "y"]:
+            stage_success = execute_deletion_pass("STAGE", stage_rules_to_delete)
+        else:
+            logger.info("⏩ [STAGE] Soft-deletion skipped by user.")
     else:
-        logger.info("⏩ [STAGE] Soft-deletion skipped by user.")
+        logger.info("ℹ️ All candidate rules are still in use on STAGE. Skipping Stage deletion.")
+        stage_success = True  # Proceed to check Prod if Stage had nothing to delete
 
     # --- STRICT PROD GATE: ONLY PROMPT IF STAGE SUCCEEDED ---
     print("\n" + "=" * 60)
     if not stage_success:
         logger.warning(
-            "⛔ [PROD GATE BLOCK] Skipping Production soft-deletion because Stage soft-deletion was skipped or failed.")
+            "⛔ [PROD GATE BLOCK] Skipping Production soft-deletion because Stage soft-deletion failed or was skipped."
+        )
         logger.info("============================================================")
         return
 
-    prod_confirm = input(
-        f"Stage soft-deletion completed successfully. Do you want to soft-delete these {len(rules_to_delete)} legacy rule(s) on PROD? (yes/no): ").strip().lower()
-    if prod_confirm in ["yes", "y"]:
-        execute_deletion_pass("PROD", rules_to_delete)
+    if prod_rules_to_delete:
+        logger.info(f"✅ Verified {len(prod_rules_to_delete)} unlinked legacy rule(s) ready for soft-deletion on PROD:")
+        for idx, name in enumerate(prod_rules_to_delete, 1):
+            logger.info(f"   {idx}. {name}")
+
+        prod_confirm = input(
+            f"\nDo you want to soft-delete these {len(prod_rules_to_delete)} legacy rule(s) on PROD? (yes/no): "
+        ).strip().lower()
+
+        if prod_confirm in ["yes", "y"]:
+            execute_deletion_pass("PROD", prod_rules_to_delete)
+        else:
+            logger.info("⏩ [PROD] Soft-deletion skipped by user.")
     else:
-        logger.info("⏩ [PROD] Soft-deletion skipped by user.")
+        logger.info("ℹ️ All candidate rules are still in use on PROD. Skipping Production deletion.")
 
     logger.info("\n============================================================")
     logger.info("✅ STAGE 10 INTERACTIVE SOFT-DELETION SEQUENCE FINISHED")
