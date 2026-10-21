@@ -4,8 +4,8 @@ Pipeline Stage 9: Ingestion Data Verifier & API Scheduler Re-Enabler.
 1. Reads batch trigger records from 'temp-data/triggered_downloads_log_api.csv'.
 2. Queries BigQuery production landing tables (`stream-listing-prod.mls_download.<content_type>`)
    using `batch_id` with polling retries to accommodate BigQuery streaming buffer flushes.
-3. Re-enables scheduled API download jobs for clean MLS targets via Production/Stage Microservice API.
-4. Triggers Download Manager Scheduler Sync.
+3. Re-enables scheduled API download jobs for clean MLS targets via Production Microservice API.
+4. Triggers Production Download Manager Scheduler Sync.
 
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
@@ -21,8 +21,10 @@ import warnings
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
-from google.cloud import bigquery
 
+from google.cloud import bigquery
+import google.auth
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig=None, frame=None):
@@ -37,7 +39,7 @@ if hasattr(signal, "SIGBREAK"):
 warnings.filterwarnings("ignore")
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / ".env")
+load_dotenv(dotenv_path=current_dir / ".env", override=True)
 
 
 def setup_logger():
@@ -81,11 +83,45 @@ PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[
     0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
 API_KEY = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
 
-# Audit attribution
+# Strictly use DB_USER for audit attribution
 UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("'\"")
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "stream-listing-prod").strip().strip("'\"")
 BQ_DATASET = "mls_download"
+
+
+# ==============================================================================
+# CREDENTIAL INITIALIZER
+# ==============================================================================
+
+def get_bigquery_client(project_id: str) -> bigquery.Client:
+    """
+    Initializes BigQuery client using local Application Default Credentials (ADC).
+    Falls back to interactive OAuth browser authentication if ADC credentials are not found.
+    """
+    try:
+        credentials, project = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        logger.info("✅ Standard Google Application Default Credentials initialized.")
+        return bigquery.Client(project=project_id, credentials=credentials)
+    except Exception:
+        logger.info("🔑 Local ADC credentials missing. Initiating interactive browser login flow...")
+        flow = InstalledAppFlow.from_client_config(
+            {
+                "installed": {
+                    "client_id": "764086051850-6qr4p5gij6nho282q2sk508p01x08g3a.apps.googleusercontent.com",
+                    "project_id": project_id,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs"
+                }
+            },
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        credentials = flow.run_local_server(port=0)
+        logger.info("✅ Interactive login successful. Tokens generated in memory.")
+        return bigquery.Client(project=project_id, credentials=credentials)
 
 
 # ==============================================================================
@@ -95,7 +131,18 @@ BQ_DATASET = "mls_download"
 def verify_batch_landing_bq(client: bigquery.Client, content_type: str, mls_id: int, batch_id: str,
                             max_attempts: int = 5, sleep_sec: int = 10) -> int:
     """Queries BigQuery to verify rows landed for a batch ID, polling to allow streaming buffer flushes."""
-    table_name = "listing" if content_type.lower() == "listing" else "open_house"
+    ct_clean = content_type.lower()
+    if ct_clean == "listing":
+        table_name = "listing"
+    elif ct_clean in ["open_house", "openhouse"]:
+        table_name = "open_house"
+    elif ct_clean == "office":
+        table_name = "office"
+    elif ct_clean in ["agent", "member"]:
+        table_name = "agent"
+    else:
+        table_name = ct_clean
+
     table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{table_name}"
 
     query = f"""
@@ -136,6 +183,7 @@ def verify_batch_landing_bq(client: bigquery.Client, content_type: str, mls_id: 
 def enable_api_jobs(session: requests.Session, mls_ids: list[int]) -> bool:
     """Re-enables scheduled API download jobs for clean MLS IDs."""
     url = f"{PROD_BASE_URL}/v1/mls-admin/mls/download/jobs/enable"
+    params = {"temp_update": "true"}
     headers = {
         "accept": "application/json",
         "api-key": API_KEY,
@@ -143,12 +191,12 @@ def enable_api_jobs(session: requests.Session, mls_ids: list[int]) -> bool:
     }
 
     payload = {
-        "mls_ids": mls_ids,
+        "sources": mls_ids,
         "updated_by": UPDATED_BY_USER
     }
 
     try:
-        response = session.post(url, headers=headers, json=payload, timeout=30)
+        response = session.post(url, params=params, headers=headers, json=payload, timeout=30)
         if response.status_code in (200, 201, 202):
             logger.info(f"✅ SUCCESS: Re-enabled API jobs for clean MLS IDs: {mls_ids}")
             return True
@@ -161,14 +209,14 @@ def enable_api_jobs(session: requests.Session, mls_ids: list[int]) -> bool:
 
 
 def sync_download_manager_scheduler(session: requests.Session) -> bool:
-    """Triggers Download Manager Scheduler Sync."""
+    """Triggers Production Download Manager Scheduler Sync."""
     url = f"{PROD_BASE_URL}/v1/download-manager/scheduler/sync"
     headers = {
         "accept": "application/json",
         "api-key": API_KEY,
     }
 
-    logger.info("🔄 ACTION: TRIGGER DOWNLOAD MANAGER SCHEDULER SYNC")
+    logger.info("🔄 ACTION: TRIGGER PRODUCTION DOWNLOAD MANAGER SCHEDULER SYNC")
     try:
         response = session.post(url, headers=headers, data="", timeout=30)
         if response.status_code in (200, 201, 202):
@@ -194,7 +242,7 @@ def main():
     triggered_log_path = current_dir / "temp-data" / "triggered_downloads_log_api.csv"
 
     if not triggered_log_path.exists():
-        logger.warning("No API trigger log found ('temp-data/triggered_downloads_log_api.csv'). Skipping Stage 9.")
+        logger.info("ℹ️ No API trigger log found ('temp-data/triggered_downloads_log_api.csv'). Skipping Stage 9.")
         return
 
     triggered_records = []
@@ -211,12 +259,12 @@ def main():
                 })
 
     if not triggered_records:
-        logger.warning("Trigger log CSV is empty. No API batch IDs to verify.")
+        logger.info("ℹ️ Trigger log CSV is empty. No API batch IDs to verify.")
         return
 
     # 1. BigQuery Data Landing Verification
     try:
-        bq_client = bigquery.Client(project=GCP_PROJECT_ID)
+        bq_client = get_bigquery_client(GCP_PROJECT_ID)
     except Exception as err:
         logger.error(f"❌ Failed to initialize BigQuery Client: {err}", exc_info=True)
         return
