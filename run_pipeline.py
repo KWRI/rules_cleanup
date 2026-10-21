@@ -135,7 +135,7 @@ def main() -> None:
 
     if not has_mutations:
         logger.info("ℹ️ All target MLS rules are already standardized (no-op batch). Finalizing repository directly.")
-        run_stage("11_sync_and_commit_repo.py")
+        run_stage("11_update_consolidated_repo.py")
         logger.info("🎉 No DB mutations needed. Ledger finalized and Git repo updated.")
         sys.exit(0)
 
@@ -173,13 +173,13 @@ def main() -> None:
             logger.warning("Pipeline paused by user prior to Production promotion.")
             sys.exit(0)
 
-    if not run_stage("7_bulk_promotion_engine.py"):
+    if not run_stage("7_run_bulk_promotion.py"):
         sys.exit(1)
 
     # ------------------------------------------------------------
     # STAGE 8: Re-Enable Jobs & Trigger Reprocess Downloads
     # ------------------------------------------------------------
-    if not run_stage("8_trigger_downloads.py"):
+    if not run_stage("8_trigger_manual_downloads.py"):
         sys.exit(1)
 
     # Wait Gate for BigQuery Landing
@@ -200,13 +200,13 @@ def main() -> None:
     else:
         if not prompt_user_confirmation(f"Have you allowed ~{args.wait_mins} minutes for downloads to land in BigQuery? Ready to verify (Stage 9)?"):
             logger.warning("Pipeline paused by user prior to BigQuery verification.")
-            logger.info("💡 You can manually run 'python 9_verify_and_enable_api.py' when ready.")
+            logger.info("💡 You can manually run 'python 9_verify_and_enable_injestion_jobs_api.py' when ready.")
             sys.exit(0)
 
     # ------------------------------------------------------------
     # STAGE 9: BigQuery Verification & API Scheduler Restoration
     # ------------------------------------------------------------
-    if not run_stage("9_verify_and_enable_api.py"):
+    if not run_stage("9_verify_and_enable_injestion_jobs_api.py"):
         logger.error("⛔ Stage 9 detected errors in BigQuery logs or failed execution. Pipeline stopped.")
         sys.exit(1)
 
@@ -219,7 +219,7 @@ def main() -> None:
     # ------------------------------------------------------------
     # STAGE 11: Repo DB Sync, DB Ledger Finalization & Git Commit/Push
     # ------------------------------------------------------------
-    if not run_stage("11_sync_and_commit_repo.py"):
+    if not run_stage("11_update_consolidated_repo.py"):
         sys.exit(1)
 
     logger.info("============================================================")
