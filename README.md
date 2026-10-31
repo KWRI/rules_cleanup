@@ -327,3 +327,18 @@ If pipeline execution halts after Stage 6 (where download jobs are disabled), re
 ```bash
 python 9_verify_and_enable_injestion_jobs_api.py
 ```
+
+## Potential Phase 2: Similar Rule Consolidation
+
+Phase 1 of Rules Cleanup focuses on identifying and consolidating rules with identical logic using AST-based comparison.
+
+A potential Phase 2 would extend this work by building scripts to identify and evaluate similar rules whose logic is related but not identical.
+
+The proposed scope includes:
+
+- Grouping candidate rules based on similarities in their code structure and logic.
+- Generating comparison reports that highlight differences in conditions, parameters, and return values.
+- Reviewing candidates to determine whether they can be consolidated into shared generic rules while preserving required behavior.
+- Extending the migration workflow to support approved consolidations, including mapping updates, validation, promotion, and safe soft-deletion.
+
+This phase is proposed future work; similarity alone would not establish that rules are interchangeable.
