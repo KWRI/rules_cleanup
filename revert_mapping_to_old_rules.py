@@ -1,19 +1,19 @@
 """
-MLS-Aware Text-Based Reverse Mapping Converter (Emergency Rollback Utility).
+Emergency Rollback Utility: MLS-Aware Reverse Mapping Reverter.
 
-Reads 'temp-data/consolidation_blueprint.csv' to dynamically map newly standardized
-generic rule names back to their exact, source-specific legacy string formats per MLS ID.
-Performs structured CSV field substitutions across 'raw_targeted_rules.csv'
-and outputs the precise rollback payload to 'reverse_targeted_rules.csv'.
+Reads 'temp-data/consolidation_blueprint.csv' to map standardized generic rule names
+back to their original source-specific legacy rule names per MLS ID.
+Performs substitutions across 'final_targeted_rules.csv' (or 'raw_targeted_rules.csv')
+and outputs the exact rollback payload to 'temp-data/reverse_targeted_rules.csv'.
 
 Usage:
-  1. Generate reverse CSV payload:
+  1. Generate rollback payload:
      python revert_mapping_to_old_rules.py
 
   2. Apply rollback to Staging DB:
      python 5_run_bulk_update.py --input-file temp-data/reverse_targeted_rules.csv --do-update
 
-Logs execution details to 'logs/pipeline_YYYY-MM-DD.log'.
+Logs execution details to console and 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
@@ -35,6 +35,7 @@ def force_terminal_exit(sig=None, frame=None):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
     os._exit(1)
 
+
 signal.signal(signal.SIGINT, force_terminal_exit)
 if hasattr(signal, "SIGBREAK"):
     signal.signal(signal.SIGBREAK, force_terminal_exit)
@@ -47,7 +48,6 @@ load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("RevertMappings")
 
 temp_data_dir = current_dir / "temp-data"
-raw_rules_path = temp_data_dir / "raw_targeted_rules.csv"
 output_reverse_path = temp_data_dir / "reverse_targeted_rules.csv"
 
 
@@ -63,35 +63,47 @@ def resolve_blueprint_path() -> Path | None:
     return None
 
 
+def resolve_source_rules_path() -> Path | None:
+    """Finds active mutation CSV payload file."""
+    candidates = [
+        temp_data_dir / "final_targeted_rules.csv",
+        temp_data_dir / "raw_targeted_rules.csv",
+    ]
+    for path in candidates:
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
+
+
 def generate_reverse_targeted_rules() -> None:
+    """Generates reverse_targeted_rules.csv for rollback."""
     logger.info("============================================================")
     logger.info("🔄 MLS-AWARE REVERSE TARGETED RULES GENERATOR INITIALIZED")
     logger.info("============================================================")
 
     blueprint_path = resolve_blueprint_path()
+    raw_rules_path = resolve_source_rules_path()
 
     if not blueprint_path or not blueprint_path.exists():
         logger.error("❌ Migration blueprint missing in 'temp-data/'.")
-        logger.error("   Expected 'consolidation_blueprint.csv' or 'migration_blueprint.csv'.")
         sys.exit(1)
 
-    if not raw_rules_path.exists():
-        logger.error(f"❌ Raw targeted rules file missing at: {raw_rules_path}")
-        logger.error("   Ensure Stage 4 generated 'raw_targeted_rules.csv' first.")
+    if not raw_rules_path or not raw_rules_path.exists():
+        logger.error("❌ Source mutation rules file missing in 'temp-data/' (neither 'final_targeted_rules.csv' nor 'raw_targeted_rules.csv' found).")
         sys.exit(1)
 
     logger.info(f"[1/2] Loading reversal candidate mappings from blueprint: '{blueprint_path.name}'...")
 
-    # Group candidates: generic_rule_name -> list of old_names
     generic_to_olds = defaultdict(list)
     with open(blueprint_path, mode="r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             old_name = row.get("old_name", "").strip()
             new_name = (
-                row.get("target_new_name") or
-                row.get("generic_rule_name") or
-                row.get("new_name") or ""
+                row.get("target_new_name")
+                or row.get("generic_rule_name")
+                or row.get("new_name")
+                or ""
             ).strip()
 
             if not old_name or not new_name:
@@ -112,21 +124,17 @@ def generate_reverse_targeted_rules() -> None:
             return gen_func_name
 
         mls_str = str(int(mls_id)).strip() if (mls_id and str(mls_id).isdigit()) else ""
-
         if mls_str:
-            # 1. Match candidates starting with MLS ID (e.g. '193AgentOfficeKeys' for MLS 193)
             for c in candidates:
                 if c.startswith(mls_str):
                     return c
-            # 2. Match candidates containing MLS ID
             for c in candidates:
                 if mls_str in c:
                     return c
 
-        # 3. Fallback to first candidate
         return candidates[0]
 
-    logger.info("[2/2] Reading raw rules and executing MLS-Aware rule function reversals...")
+    logger.info(f"[2/2] Reading '{raw_rules_path.name}' and executing rule reversals...")
 
     total_replacements = 0
     reverted_rows = []
@@ -164,7 +172,6 @@ def generate_reverse_targeted_rules() -> None:
 
             reverted_rows.append(row)
 
-    # Output to reverse target file
     with open(output_reverse_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

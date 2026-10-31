@@ -1,12 +1,12 @@
 """
-Pipeline Stage 6: Multi-Protocol Ingestion Job Disabler & Scheduler Sync.
+Pipeline Stage 6: Multi-Protocol Ingestion Job Disabler & Scheduler Sync Engine.
 
 Parses target batch files ('temp-data/batch_mls_targets_rets.csv', 'temp-data/batch_mls_targets_api.csv',
-or 'temp-data/batch_mls_targets.csv') and disables download jobs based on 'download_protocol':
-  - RETS Integration: Disables target Jenkins jobs over the Jenkins HTTP API using mls_id & mls_id_str patterns.
-  - API Integration: Disables target API download jobs via production numeric mls_id payloads AND triggers Scheduler Sync.
+or 'temp-data/batch_mls_targets.csv') and disables download jobs prior to Production promotion:
+  - RETS Feeds: Disables target Jenkins jobs over Jenkins HTTP API using CSRF crumbs.
+  - API Feeds: Disables API download jobs via Microservice API and triggers Download Manager Scheduler Sync.
 
-Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
+Logs execution events to console and 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
@@ -20,7 +20,6 @@ import warnings
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
-
 
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig=None, frame=None):
@@ -39,7 +38,8 @@ load_dotenv(dotenv_path=current_dir / ".env")
 
 
 def setup_logger():
-    log_dir = Path("logs")
+    """Initializes console and rotating daily file logger."""
+    log_dir = current_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     today_str = datetime.now().strftime("%Y-%m-%d")
     log_file = log_dir / f"pipeline_{today_str}.log"
@@ -68,15 +68,14 @@ JENKINS_USER = (os.getenv("JENKINS_USER", "")).strip().strip("'\"")
 JENKINS_TOKEN = (os.getenv("JENKINS_PROD_TOKEN") or os.getenv("JENKINS_STAGE_TOKEN", "")).strip().strip("'\"")
 
 # API Microservice Config (API)
-MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip(
-    "'\"").rstrip("/")
-PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[
-    0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
+MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip("'\"").rstrip("/")
+PROD_BASE_URL = (
+    MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0]
+    if "/v1/mls-admin" in MLS_ADMIN_PROD_URL
+    else MLS_ADMIN_PROD_URL
+)
 
-API_BASE_URL = MLS_ADMIN_PROD_URL
 MLS_ADMIN_API_KEY = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
-
-# Audit attribution user
 UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("'\"")
 
 
@@ -84,37 +83,52 @@ UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("
 # CODE BLOCK 1: RETS INGESTION JOB MANAGEMENT (JENKINS)
 # ==============================================================================
 
-def get_all_jenkins_jobs() -> list:
-    """Fetch all job names and URLs from the Jenkins API."""
+def get_jenkins_crumb(session: requests.Session) -> dict:
+    """Retrieves Jenkins CSRF crumb header to prevent 403 Forbidden errors."""
+    if not JENKINS_URL:
+        return {}
+    base_url = JENKINS_URL.rstrip("/")
+    try:
+        response = session.get(f"{base_url}/crumbIssuer/api/json", timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return {data["crumbRequestField"]: data["crumb"]}
+    except Exception:
+        pass
+    return {}
+
+
+def get_all_jenkins_jobs(session: requests.Session) -> list:
+    """Fetches all job names and URLs from the Jenkins API."""
     if not JENKINS_URL or not JENKINS_TOKEN:
-        logger.error("Missing JENKINS_PROD_URL / JENKINS_STAGE_URL or JENKINS_TOKEN in environment configuration.")
+        logger.error("❌ Missing JENKINS_PROD_URL / JENKINS_STAGE_URL or JENKINS_TOKEN in configuration.")
         return []
 
     base_url = JENKINS_URL.rstrip("/")
     url = f"{base_url}/api/json?tree=jobs[name,url]"
 
     try:
-        response = requests.get(url, auth=(JENKINS_USER, JENKINS_TOKEN), timeout=15)
+        response = session.get(url, timeout=15)
         if response.status_code == 200:
             return response.json().get("jobs", [])
         elif response.status_code == 401:
-            logger.error("Jenkins Authentication failed (401). Please check JENKINS_TOKEN.")
+            logger.error("❌ Jenkins Authentication failed (401). Please check JENKINS_TOKEN.")
             return []
         else:
-            logger.error(f"Failed to fetch Jenkins jobs. HTTP Status: {response.status_code}")
+            logger.error(f"❌ Failed to fetch Jenkins jobs. HTTP Status: {response.status_code}")
             return []
     except Exception as err:
-        logger.error(f"Error connecting to Jenkins: {err}")
+        logger.error(f"❌ Error connecting to Jenkins: {err}")
         return []
 
 
-def disable_jenkins_job(job_name: str) -> bool:
+def disable_jenkins_job(session: requests.Session, job_name: str, headers: dict) -> bool:
     """Disables a specific Jenkins job."""
     base_url = JENKINS_URL.rstrip("/")
     url = f"{base_url}/job/{job_name}/disable"
 
     try:
-        response = requests.post(url, auth=(JENKINS_USER, JENKINS_TOKEN), timeout=15)
+        response = session.post(url, headers=headers, timeout=15)
         if response.status_code in [200, 201, 302]:
             logger.info(f"✅ Successfully disabled Jenkins job: {job_name}")
             return True
@@ -122,7 +136,7 @@ def disable_jenkins_job(job_name: str) -> bool:
             logger.error(f"❌ Failed to disable Jenkins job {job_name}. HTTP Status: {response.status_code}")
             return False
     except Exception as err:
-        logger.error(f"Error disabling Jenkins job {job_name}: {err}")
+        logger.error(f"❌ Error disabling Jenkins job {job_name}: {err}")
         return False
 
 
@@ -132,9 +146,13 @@ def process_rets_disabling(rets_targets: set):
     logger.info(f"⚙️ [RETS BLOCK] Processing {len(rets_targets)} unique target pair(s) via Jenkins...")
     logger.info("------------------------------------------------------------")
 
-    jenkins_jobs = get_all_jenkins_jobs()
+    session = requests.Session()
+    session.auth = (JENKINS_USER, JENKINS_TOKEN)
+    headers = get_jenkins_crumb(session)
+
+    jenkins_jobs = get_all_jenkins_jobs(session)
     if not jenkins_jobs:
-        logger.warning("No jobs returned from Jenkins. Skipping RETS job disabling.")
+        logger.warning("⚠️ No jobs returned from Jenkins. Skipping RETS job disabling.")
         return
 
     matched_jobs_dict = {}
@@ -149,7 +167,7 @@ def process_rets_disabling(rets_targets: set):
 
     for job in matched_jobs:
         logger.info(f" - Matched Job: {job['name']} ({job['url']})")
-        disable_jenkins_job(job["name"])
+        disable_jenkins_job(session, job["name"], headers)
 
 
 # ==============================================================================
@@ -159,7 +177,7 @@ def process_rets_disabling(rets_targets: set):
 def trigger_scheduler_sync() -> bool:
     """Triggers Download Manager Scheduler Sync POST call."""
     if not PROD_BASE_URL:
-        logger.error("Missing MLS_ADMIN_PROD_URL / MLS_ADMIN_STAGE_URL in environment configuration.")
+        logger.error("❌ Missing MLS_ADMIN_PROD_URL / MLS_ADMIN_STAGE_URL in configuration.")
         return False
 
     sync_url = f"{PROD_BASE_URL}/v1/download-manager/scheduler/sync"
@@ -175,7 +193,6 @@ def trigger_scheduler_sync() -> bool:
         response = requests.post(sync_url, headers=headers, data="", timeout=15)
         if response.status_code in (200, 201, 204):
             logger.info("✅ SUCCESS: Download Manager Scheduler synchronized successfully.")
-            logger.info(f"Response: {response.text}")
             return True
         else:
             logger.error(f"❌ SCHEDULER SYNC FAILED [{response.status_code}]: {response.text}")
@@ -187,22 +204,22 @@ def trigger_scheduler_sync() -> bool:
 
 def disable_api_download_jobs_batch(mls_ids: list[int]) -> bool:
     """Disables MLS Download Jobs for target sources using numeric mls_id list."""
-    if not API_BASE_URL:
-        logger.error("Missing MLS_ADMIN_PROD_URL / MLS_ADMIN_STAGE_URL in environment configuration.")
+    if not PROD_BASE_URL:
+        logger.error("❌ Missing MLS_ADMIN_PROD_URL / MLS_ADMIN_STAGE_URL in configuration.")
         return False
 
-    endpoint = f"{API_BASE_URL}/mls/download/jobs/disable"
+    endpoint = f"{PROD_BASE_URL}/v1/mls-admin/mls/download/jobs/disable"
     params = {"temp_update": "true"}
 
     headers = {
         "accept": "application/json",
         "api-key": MLS_ADMIN_API_KEY,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     payload = {
         "sources": mls_ids,
-        "updated_by": UPDATED_BY_USER
+        "updated_by": UPDATED_BY_USER,
     }
 
     logger.info(f"Target API MLS IDs ({len(mls_ids)}) : {mls_ids}")
@@ -210,9 +227,8 @@ def disable_api_download_jobs_batch(mls_ids: list[int]) -> bool:
 
     try:
         response = requests.post(endpoint, params=params, headers=headers, json=payload, timeout=15)
-        if response.status_code in (200, 201):
+        if response.status_code in (200, 201, 202):
             logger.info("✅ SUCCESS: Download jobs successfully DISABLED for API targets.")
-            logger.info(f"Response: {response.text}")
             return True
         else:
             logger.error(f"❌ FAILED TO DISABLE API JOBS [{response.status_code}]: {response.text}")
@@ -230,7 +246,7 @@ def process_api_disabling(api_targets: set):
 
     mls_ids = sorted([int(mls_id) for mls_id, _ in api_targets if mls_id.isdigit()])
     if not mls_ids:
-        logger.warning("No valid numeric MLS IDs found for API targets.")
+        logger.warning("⚠️ No valid numeric MLS IDs found for API targets.")
         return
 
     # 1. Batch disable API download jobs
@@ -294,7 +310,7 @@ def run_job_disabling():
         process_api_disabling(api_targets)
 
     if not rets_targets and not api_targets:
-        logger.warning("No RETS or API targets discovered in batch CSVs. No jobs were disabled.")
+        logger.warning("ℹ️ No RETS or API targets discovered in batch CSVs. No jobs were disabled.")
 
 
 if __name__ == "__main__":

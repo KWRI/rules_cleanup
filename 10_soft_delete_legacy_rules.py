@@ -32,7 +32,6 @@ from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.hazmat.primitives import serialization
 
-
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig=None, frame=None):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
@@ -45,7 +44,7 @@ if hasattr(signal, "SIGBREAK"):
 
 warnings.filterwarnings("ignore")
 
-if not hasattr(paramiko, 'DSSKey'):
+if not hasattr(paramiko, "DSSKey"):
     paramiko.DSSKey = paramiko.PKey
 
 current_dir = Path(__file__).resolve().parent
@@ -53,7 +52,8 @@ load_dotenv(dotenv_path=current_dir / ".env")
 
 
 def setup_logger():
-    log_dir = Path("logs")
+    """Initializes console and rotating daily file logger."""
+    log_dir = current_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     today_str = datetime.now().strftime("%Y-%m-%d")
     log_file = log_dir / f"pipeline_{today_str}.log"
@@ -81,7 +81,6 @@ def load_legacy_candidates(temp_data_dir: Path) -> list[str]:
     """Loads legacy rule candidate names from consolidation_blueprint.csv and safe_to_delete.csv."""
     candidates = set()
 
-    # 1. Read consolidation_blueprint.csv
     blueprint_path = temp_data_dir / "consolidation_blueprint.csv"
     if blueprint_path.exists():
         with open(blueprint_path, mode="r", encoding="utf-8") as f:
@@ -91,7 +90,6 @@ def load_legacy_candidates(temp_data_dir: Path) -> list[str]:
                 if old_name:
                     candidates.add(old_name)
 
-    # 2. Read safe_to_delete.csv (unmapped rules)
     safe_to_delete_path = temp_data_dir / "safe_to_delete.csv"
     if safe_to_delete_path.exists():
         with open(safe_to_delete_path, mode="r", encoding="utf-8") as f:
@@ -105,6 +103,7 @@ def load_legacy_candidates(temp_data_dir: Path) -> list[str]:
 
 
 def load_ssh_pkey(key_path: str, passphrase: str):
+    """Loads private RSA key from filesystem for SSH authentication."""
     with open(key_path, "rb") as key_file:
         private_key = serialization.load_pem_private_key(
             key_file.read(),
@@ -119,12 +118,8 @@ def load_ssh_pkey(key_path: str, passphrase: str):
 
 
 def get_active_rule_usage_counts_db(env_prefix: str, rule_names: list[str]) -> dict[str, int]:
-    """
-    Connects over SSH tunnel to check if rules are referenced by ANY active MLS mapping
-    in the specified environment (STAGE or PROD).
-    """
-    ssh_host = (os.getenv(f"{env_prefix}_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip(
-        "'\"")
+    """Connects over SSH tunnel to check if rules are referenced by active MLS mappings."""
+    ssh_host = (os.getenv(f"{env_prefix}_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
     ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
     ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
     ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
@@ -146,17 +141,17 @@ def get_active_rule_usage_counts_db(env_prefix: str, rule_names: list[str]) -> d
         logger.info(f"Connecting to {env_prefix} DB ({db_host}) over SSH to verify active UI map references...")
 
         with SSHTunnelForwarder(
-                (ssh_host, 22),
-                ssh_username=ssh_user,
-                ssh_pkey=pkey,
-                remote_bind_address=(db_host, 5432),
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=pkey,
+            remote_bind_address=(db_host, 5432),
         ) as tunnel:
             with psycopg2.connect(
-                    dbname=db_name,
-                    user=db_user,
-                    password=db_pass,
-                    host="127.0.0.1",
-                    port=tunnel.local_bind_port,
+                dbname=db_name,
+                user=db_user,
+                password=db_pass,
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
             ) as conn:
                 with conn.cursor() as cur:
                     query = """
@@ -196,8 +191,7 @@ def delete_rule_via_api(api_url: str, api_key: str, rule_name: str, deleted_by: 
             logger.info(f"   ✅ Soft-deleted legacy rule '{rule_name}' (ID: {rule_id}) via API.")
             return True
         else:
-            logger.error(
-                f"   ❌ Soft-delete API failed for '{rule_name}' [HTTP {response.status_code}]: {response.text}")
+            logger.error(f"   ❌ Soft-delete API failed for '{rule_name}' [HTTP {response.status_code}]: {response.text}")
             return False
     except requests.RequestException as e:
         logger.error(f"   ❌ Request exception for '{rule_name}': {e}", exc_info=True)
@@ -205,12 +199,8 @@ def delete_rule_via_api(api_url: str, api_key: str, rule_name: str, deleted_by: 
 
 
 def execute_deletion_pass(env_prefix: str, rules_to_delete: list[str]) -> bool:
-    """
-    Executes API soft-deletions for the specified environment.
-    Returns True ONLY if ALL candidate rules were successfully soft-deleted.
-    """
-    api_url = (os.getenv(f"MLS_ADMIN_{env_prefix}_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip(
-        "'\"").rstrip("/")
+    """Executes API soft-deletions for the specified environment."""
+    api_url = (os.getenv(f"MLS_ADMIN_{env_prefix}_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip("'\"").rstrip("/")
     api_key = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
     deleted_by_user = (os.getenv("DB_USER") or "migration_pipeline_bot").strip().strip("'\"")
 
@@ -218,8 +208,7 @@ def execute_deletion_pass(env_prefix: str, rules_to_delete: list[str]) -> bool:
         logger.error(f"❌ Missing API configuration for {env_prefix} environment.")
         return False
 
-    logger.info(
-        f"🚀 Starting {env_prefix} Microservice API soft-deletion sequence for {len(rules_to_delete)} rule(s)...")
+    logger.info(f"🚀 Starting {env_prefix} Microservice API soft-deletion sequence for {len(rules_to_delete)} rule(s)...")
     success_count = 0
     for name in rules_to_delete:
         if delete_rule_via_api(api_url, api_key, name, deleted_by_user):
@@ -243,26 +232,23 @@ def main() -> None:
 
     logger.info(f"📄 Loaded {len(legacy_candidates)} legacy candidate rule(s) for verification.")
 
-    # 1. Step 1: Query Staging DB Dependencies
+    # 1. Step 1: Query Staging DB
     logger.info("\n🔍 Step 1/2: Checking Staging DB active map dependencies...")
     stage_counts = get_active_rule_usage_counts_db("STAGE", legacy_candidates)
 
-    # 2. Step 2: Query Production DB Dependencies
+    # 2. Step 2: Query Production DB
     logger.info("\n🔍 Step 2/2: Checking Production DB active map dependencies...")
     prod_counts = get_active_rule_usage_counts_db("PROD", legacy_candidates)
 
-    # Filter candidates per environment based on process map references
     stage_rules_to_delete = [name for name in legacy_candidates if stage_counts.get(name, 0) == 0]
     prod_rules_to_delete = [name for name in legacy_candidates if prod_counts.get(name, 0) == 0]
 
-    # Log Stage status
     stage_retained = [(name, stage_counts[name]) for name in legacy_candidates if stage_counts.get(name, 0) > 0]
     if stage_retained:
         logger.info(f"\n⚠️ [STAGE] Retaining {len(stage_retained)} rule(s) referenced by active Staging maps:")
         for name, refs in stage_retained:
             logger.info(f"   • '{name}' -> Active Stage References: {refs} (SKIPPED ON STAGE)")
 
-    # Log Prod status
     prod_retained = [(name, prod_counts[name]) for name in legacy_candidates if prod_counts.get(name, 0) > 0]
     if prod_retained:
         logger.info(f"\n⚠️ [PROD] Retaining {len(prod_retained)} rule(s) referenced by active Production maps:")
@@ -273,7 +259,7 @@ def main() -> None:
         logger.info("\n🎉 No legacy rules are ready for soft-deletion in either environment.")
         return
 
-    # --- INTERACTIVE PROMPT 1: STAGE ---
+    # Prompt 1: STAGE
     print("\n" + "=" * 60)
     stage_success = False
 
@@ -292,14 +278,12 @@ def main() -> None:
             logger.info("⏩ [STAGE] Soft-deletion skipped by user.")
     else:
         logger.info("ℹ️ All candidate rules are still in use on STAGE. Skipping Stage deletion.")
-        stage_success = True  # Proceed to check Prod if Stage had nothing to delete
+        stage_success = True
 
-    # --- STRICT PROD GATE: ONLY PROMPT IF STAGE SUCCEEDED ---
+    # Prompt 2: PROD GATE
     print("\n" + "=" * 60)
     if not stage_success:
-        logger.warning(
-            "⛔ [PROD GATE BLOCK] Skipping Production soft-deletion because Stage soft-deletion failed or was skipped."
-        )
+        logger.warning("⛔ [PROD GATE BLOCK] Skipping Production soft-deletion because Stage soft-deletion failed or was skipped.")
         logger.info("============================================================")
         return
 

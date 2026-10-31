@@ -15,16 +15,10 @@ import sys
 import csv
 import time
 import signal
-import logging
 import requests
 import warnings
 from pathlib import Path
-from datetime import datetime
 from dotenv import load_dotenv
-
-from google.cloud import bigquery
-import google.auth
-from google_auth_oauthlib.flow import InstalledAppFlow
 
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig=None, frame=None):
@@ -38,33 +32,16 @@ if hasattr(signal, "SIGBREAK"):
 
 warnings.filterwarnings("ignore")
 
+try:
+    from pipeline_logger import setup_logger
+    logger = setup_logger("Stage9_VerifyAndEnableAPI")
+except ImportError:
+    import logging
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s")
+    logger = logging.getLogger("Stage9_VerifyAndEnableAPI")
+
 current_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=current_dir / ".env", override=True)
-
-
-def setup_logger():
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    log_file = log_dir / f"pipeline_{today_str}.log"
-
-    logger = logging.getLogger("Stage9_VerifyAndEnableAPI")
-    logger.setLevel(logging.INFO)
-    if not logger.hasHandlers():
-        formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-
-        c_handler = logging.StreamHandler(sys.stdout)
-        c_handler.setFormatter(formatter)
-        logger.addHandler(c_handler)
-
-        f_handler = logging.FileHandler(log_file, encoding="utf-8")
-        f_handler.setFormatter(formatter)
-        logger.addHandler(f_handler)
-
-    return logger
-
-
-logger = setup_logger()
 
 # Locate GCP Credentials File if present
 gcp_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip().strip("'\"")
@@ -77,13 +54,10 @@ if gcp_creds_path and os.path.exists(gcp_creds_path):
 # ==============================================================================
 # ENVIRONMENT CONSTANTS
 # ==============================================================================
-MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip(
-    "'\"").rstrip("/")
-PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[
-    0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
-API_KEY = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
+MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip("'\"").rstrip("/")
+PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
+API_KEY = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY") or os.getenv("API_KEY", "")).strip().strip("'\"")
 
-# Strictly use DB_USER for audit attribution
 UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("'\"")
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "stream-listing-prod").strip().strip("'\"")
@@ -91,14 +65,22 @@ BQ_DATASET = "mls_download"
 
 
 # ==============================================================================
-# CREDENTIAL INITIALIZER
+# CREDENTIAL INITIALIZER (LAZY-LOADED)
 # ==============================================================================
 
-def get_bigquery_client(project_id: str) -> bigquery.Client:
+def get_bigquery_client(project_id: str):
     """
     Initializes BigQuery client using local Application Default Credentials (ADC).
     Falls back to interactive OAuth browser authentication if ADC credentials are not found.
+    Imports are isolated here so the script does not crash on non-API/RETS batches.
     """
+    try:
+        from google.cloud import bigquery
+        import google.auth
+    except ImportError as e:
+        logger.error("❌ Missing BigQuery libraries. Install via: pip install google-cloud-bigquery google-auth")
+        raise e
+
     try:
         credentials, project = google.auth.default(
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
@@ -107,6 +89,12 @@ def get_bigquery_client(project_id: str) -> bigquery.Client:
         return bigquery.Client(project=project_id, credentials=credentials)
     except Exception:
         logger.info("🔑 Local ADC credentials missing. Initiating interactive browser login flow...")
+        try:
+            from google_auth_oauthlib.flow import InstalledAppFlow
+        except ImportError as e:
+            logger.error("❌ Missing OAuth library. Install via: pip install google-auth-oauthlib")
+            raise e
+
         flow = InstalledAppFlow.from_client_config(
             {
                 "installed": {
@@ -128,7 +116,7 @@ def get_bigquery_client(project_id: str) -> bigquery.Client:
 # BIGQUERY VERIFICATION ENGINE
 # ==============================================================================
 
-def verify_batch_landing_bq(client: bigquery.Client, content_type: str, mls_id: int, batch_id: str,
+def verify_batch_landing_bq(client, content_type: str, mls_id: int, batch_id: str,
                             max_attempts: int = 5, sleep_sec: int = 10) -> int:
     """Queries BigQuery to verify rows landed for a batch ID, polling to allow streaming buffer flushes."""
     ct_clean = content_type.lower()
@@ -266,7 +254,7 @@ def main():
     try:
         bq_client = get_bigquery_client(GCP_PROJECT_ID)
     except Exception as err:
-        logger.error(f"❌ Failed to initialize BigQuery Client: {err}", exc_info=True)
+        logger.error(f"❌ Failed to initialize BigQuery Client: {err}")
         return
 
     mls_verified_map = {}

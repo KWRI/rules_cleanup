@@ -4,7 +4,7 @@ Pipeline Stage 11: Core Repo Ingress Sync, DB Rule Ledger Finalization & Git Com
 1. Updates `public.processed_rules_ledger` DB table setting status to 'COMPLETED' for processed rules.
 2. Connects to Staging DB over SSH tunnel to pull fresh process rule records (`public.process_rule`).
 3. Writes active rules to 'ui-rules/active/' and archived rules to 'ui-rules/archived/'.
-4. Purges all files from 'temp-data/' directory.
+4. Purges all files from 'temp-data/' directory (with Windows read-only lock clearing).
 5. Purges log files older than 3 days in 'logs/'.
 6. Automatically executes Git Add, Commit, and Push on the 'dm-consolidated-rules' repository.
 """
@@ -12,7 +12,9 @@ Pipeline Stage 11: Core Repo Ingress Sync, DB Rule Ledger Finalization & Git Com
 import os
 import io
 import sys
+import csv
 import re
+import stat
 import time
 import shutil
 import signal
@@ -28,7 +30,6 @@ from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.hazmat.primitives import serialization
 
-
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig=None, frame=None):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
@@ -41,7 +42,7 @@ if hasattr(signal, "SIGBREAK"):
 
 warnings.filterwarnings("ignore")
 
-if not hasattr(paramiko, 'DSSKey'):
+if not hasattr(paramiko, "DSSKey"):
     paramiko.DSSKey = paramiko.PKey
 
 current_dir = Path(__file__).resolve().parent
@@ -49,7 +50,8 @@ load_dotenv(dotenv_path=current_dir / ".env")
 
 
 def setup_logger():
-    log_dir = Path("logs")
+    """Initializes console and rotating daily file logger."""
+    log_dir = current_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     today_str = datetime.now().strftime("%Y-%m-%d")
     log_file = log_dir / f"pipeline_{today_str}.log"
@@ -74,6 +76,7 @@ logger = setup_logger()
 
 
 def load_ssh_pkey(key_path: str, passphrase: str):
+    """Loads private RSA key from filesystem for SSH authentication."""
     with open(key_path, "rb") as key_file:
         private_key = serialization.load_pem_private_key(
             key_file.read(),
@@ -90,7 +93,7 @@ def load_ssh_pkey(key_path: str, passphrase: str):
 def sanitize_filename(raw_name: str) -> str:
     """Sanitizes rule names into safe filenames, ensuring a single .py extension."""
     clean = raw_name.replace("/", "__").replace("\\", "__")
-    clean = re.sub(r'[\x00-\x1f:*?"<>|]', '', clean).strip()
+    clean = re.sub(r'[\x00-\x1f:*?"<>|]', "", clean).strip()
     if not clean:
         clean = "unnamed_rule"
     if not clean.lower().endswith(".py"):
@@ -135,17 +138,17 @@ def sync_db_to_local_repo(repo_path: Path) -> bool:
         pkey = load_ssh_pkey(ssh_key_path, ssh_passphrase)
         logger.info(f"Establishing SSH tunnel to connect to database '{db_name}'...")
         with SSHTunnelForwarder(
-                (ssh_host, 22),
-                ssh_username=ssh_user,
-                ssh_pkey=pkey,
-                remote_bind_address=(db_host, 5432),
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=pkey,
+            remote_bind_address=(db_host, 5432),
         ) as tunnel:
             with psycopg2.connect(
-                    dbname=db_name,
-                    user=db_user,
-                    password=db_pass,
-                    host="127.0.0.1",
-                    port=tunnel.local_bind_port,
+                dbname=db_name,
+                user=db_user,
+                password=db_pass,
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
             ) as conn:
                 conn.set_session(isolation_level="REPEATABLE READ", readonly=True)
                 cursor_name = f"rule_pull_cursor_{int(time.time())}"
@@ -193,8 +196,7 @@ def sync_db_to_local_repo(repo_path: Path) -> bool:
                                 failed_writes += 1
                                 logger.error(f"⚠️ Failed file write task: {exc}")
 
-                    logger.info(
-                        f"✅ DB Sync Complete: Successfully wrote {file_count} process rule files to repository disk.")
+                    logger.info(f"✅ DB Sync Complete: Successfully wrote {file_count} process rule files to repository disk.")
                     return True
 
     except Exception as e:
@@ -203,16 +205,12 @@ def sync_db_to_local_repo(repo_path: Path) -> bool:
 
 
 def finalize_processed_rules_ledger_db(temp_dir: Path) -> None:
-    """
-    Updates status in public.processed_rules_ledger from IN_PROGRESS to COMPLETED
-    for all rules processed in this batch.
-    """
+    """Updates status in public.processed_rules_ledger to COMPLETED for all rules processed in this batch."""
     blueprint_path = temp_dir / "consolidation_blueprint.csv"
     if not blueprint_path.exists():
         return
 
     rule_names = []
-    import csv
     with open(blueprint_path, mode="r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -237,17 +235,17 @@ def finalize_processed_rules_ledger_db(temp_dir: Path) -> None:
         pkey = load_ssh_pkey(ssh_key_path, ssh_passphrase)
         logger.info(f"Updating public.processed_rules_ledger in DB to 'COMPLETED' for {len(rule_names)} rule(s)...")
         with SSHTunnelForwarder(
-                (ssh_host, 22),
-                ssh_username=ssh_user,
-                ssh_pkey=pkey,
-                remote_bind_address=(db_host, 5432),
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=pkey,
+            remote_bind_address=(db_host, 5432),
         ) as tunnel:
             with psycopg2.connect(
-                    dbname=db_name,
-                    user=db_user,
-                    password=db_pass,
-                    host="127.0.0.1",
-                    port=tunnel.local_bind_port,
+                dbname=db_name,
+                user=db_user,
+                password=db_pass,
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
             ) as conn:
                 with conn.cursor() as cur:
                     update_query = """
@@ -262,8 +260,17 @@ def finalize_processed_rules_ledger_db(temp_dir: Path) -> None:
         logger.error(f"❌ Failed to update processed_rules_ledger in DB: {e}", exc_info=True)
 
 
+def _remove_readonly(func, path, exc_info):
+    """Error handler for shutil.rmtree to clear read-only permissions on Windows."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+
 def purge_temp_data_folder(temp_dir: Path) -> None:
-    """Completely purges all files and subdirectories from temp-data/."""
+    """Completely purges all files and subdirectories from temp-data/ with Windows lock handling."""
     if not temp_dir.exists():
         return
 
@@ -273,13 +280,25 @@ def purge_temp_data_folder(temp_dir: Path) -> None:
     for item in temp_dir.glob("*"):
         try:
             if item.is_file() or item.is_symlink():
+                try:
+                    os.chmod(item, stat.S_IWRITE)
+                except Exception:
+                    pass
                 item.unlink()
                 deleted_files_count += 1
             elif item.is_dir():
-                shutil.rmtree(item)
+                shutil.rmtree(item, onerror=_remove_readonly)
                 deleted_files_count += 1
         except Exception as e:
-            logger.warning(f"⚠️ Could not delete '{item.name}': {e}")
+            time.sleep(0.5)
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, onerror=_remove_readonly)
+                else:
+                    item.unlink()
+                deleted_files_count += 1
+            except Exception as retry_err:
+                logger.warning(f"⚠️ Could not delete '{item.name}': {retry_err}")
 
     logger.info(f"✅ Temp Folder Cleaned: Purged {deleted_files_count} item(s) from 'temp-data/'.")
 
@@ -321,23 +340,19 @@ def execute_git_commit_and_push(repo_path: Path) -> bool:
         return res.stdout.strip()
 
     try:
-        # 1. Git Add
         logger.info("[1/3] Staging modified and new files (git add .)...")
         run_git_command(["git", "add", "."])
 
-        # Check git status
         status_out = run_git_command(["git", "status", "--porcelain"])
         if not status_out:
             logger.info("ℹ️ Git working tree is clean. No changes to commit.")
             return True
 
-        # 2. Git Commit
         commit_msg = f"chore(rules-cleanup): Standardized generic rules & UI map updates [{datetime.now().strftime('%Y-%m-%d %H:%M')}]"
         logger.info(f"[2/3] Committing changes: '{commit_msg}'...")
         commit_out = run_git_command(["git", "commit", "-m", commit_msg])
         logger.info(f"   Git Commit Output:\n{commit_out}")
 
-        # 3. Git Push
         logger.info("[3/3] Pushing changes to remote repository (git push)...")
         push_out = run_git_command(["git", "push"])
         logger.info(f"   Git Push Output:\n{push_out}")
@@ -366,21 +381,14 @@ def main() -> None:
     logger.info("============================================================")
     logger.info(f"Target REPO_PATH: {repo_path}")
 
-    # 1. Update public.processed_rules_ledger in DB to 'COMPLETED'
     finalize_processed_rules_ledger_db(temp_dir)
 
-    # 2. Sync Staging DB process rules to local repository folder (active / archived)
     if not sync_db_to_local_repo(repo_path):
         logger.error("❌ Sync halted due to DB extraction error.")
         return
 
-    # 3. Purge temp-data/ folder completely
     purge_temp_data_folder(temp_dir)
-
-    # 4. Clean logs older than 3 days
     cleanup_old_logs(current_dir / "logs", keep_days=3)
-
-    # 5. Execute Git commit and push to dm-consolidated-rules
     execute_git_commit_and_push(repo_path)
 
     logger.info("============================================================")

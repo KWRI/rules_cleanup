@@ -1,7 +1,12 @@
 """
-Groups and Compares Database Rules by Logic Equivalency with Ledger Locking & File Exclusion Rules.
+Groups and Compares Database Rules by Strict Logic & Literal Value Equivalency with Ledger Locking & File Exclusion Rules.
 Equipped with OS-level instant terminal abort signal handlers (SIGINT / SIGBREAK).
 Extracts created_at and updated_at to enable recency-aware candidate selection.
+
+Folder Structure Output:
+  - Python Rule Folders: temp-data/grouped/<group_folder>/<rule_name>.py
+  - Comparison CSV:      temp-data/comparison_report.csv
+  - Rule Info CSV:        temp-data/rule_info.csv
 """
 import os
 import io
@@ -12,16 +17,17 @@ import argparse
 import logging
 import warnings
 import ast
-import re
 from pathlib import Path
 from difflib import SequenceMatcher
 from itertools import combinations
 from datetime import datetime
 
+
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig, frame):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
     os._exit(1)
+
 
 signal.signal(signal.SIGINT, force_terminal_exit)
 if hasattr(signal, "SIGBREAK"):
@@ -30,6 +36,7 @@ if hasattr(signal, "SIGBREAK"):
 warnings.filterwarnings("ignore")
 try:
     from cryptography.utils import CryptographyDeprecationWarning
+
     warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 except ImportError:
     pass
@@ -84,7 +91,11 @@ def load_ssh_pkey(key_path: str, passphrase: str):
 def load_excluded_patterns(logger: logging.Logger) -> list[str]:
     """Reads excluded rule keywords from excluded_rule_patterns.txt."""
     patterns = []
-    file_paths = [Path("excluded_rule_patterns.txt"), Path("temp-data/excluded_rule_patterns.txt")]
+    file_paths = [
+        Path("excluded_rule_patterns.txt"),
+        Path("temp-data/excluded_rule_patterns.txt"),
+        Path("temp-data/grouped/excluded_rule_patterns.txt")
+    ]
 
     for path in file_paths:
         if path.exists():
@@ -230,22 +241,27 @@ def lock_rules_in_ledger(rule_group_map: dict, db_user: str, logger):
         logger.error(f"❌ Failed to lock rules in DB ledger: {e}", exc_info=True)
 
 
-class SkeletonMapper(ast.NodeTransformer):
-    def visit_Name(self, n): return ast.copy_location(ast.Name('v', n.ctx), n)
-    def visit_Constant(self, n): return ast.copy_location(ast.Constant('c'), n)
-    def visit_FunctionDef(self, n): n.name = 'f'; self.generic_visit(n); return n
-    def visit_AsyncFunctionDef(self, n): n.name = 'f'; self.generic_visit(n); return n
+class StrictRuleNormalizer(ast.NodeTransformer):
+    """
+    Only removes docstrings so docstring text/formatting differences don't break comparisons.
+    Keeps 100% of the actual Python code intact, including all string constants (like mls_id),
+    dictionary keys/values, variable names, and method calls (.upper()).
+    """
+
+    def visit_FunctionDef(self, node):
+        if (node.body and isinstance(node.body[0], ast.Expr) and
+                isinstance(node.body[0].value, ast.Constant)):
+            node.body.pop(0)
+        self.generic_visit(node)
+        return node
 
 
-def get_normalized_structure(source):
+def get_normalized_structure(source: str):
     try:
         tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
-                    and node.body and isinstance(node.body[0], ast.Expr) \
-                    and isinstance(node.body[0].value, ast.Constant):
-                node.body.pop(0)
-        return "".join(ast.unparse(SkeletonMapper().visit(tree)).split())
+        transformed = StrictRuleNormalizer().visit(tree)
+        # ast.unparse rebuilds clean Python code, stripping formatting/whitespace
+        return "".join(ast.unparse(transformed).split())
     except (SyntaxError, TypeError):
         return None
 
@@ -255,7 +271,10 @@ def run_grouping_and_comparison(limit: int, name_threshold: float, code_threshol
     logger.info("--- Starting Rule Grouping and Comparison Process ---")
 
     temp_dir = Path("temp-data")
+    grouped_dir = temp_dir / "grouped"
+
     temp_dir.mkdir(parents=True, exist_ok=True)
+    grouped_dir.mkdir(parents=True, exist_ok=True)
 
     all_data, current_db_user = get_unprocessed_rules_from_db(logger)
     if not all_data:
@@ -298,7 +317,7 @@ def run_grouping_and_comparison(limit: int, name_threshold: float, code_threshol
 
     for i, group in enumerate(groups_to_process, 1):
         folder_name = min(group, key=len)
-        group_dir = temp_dir / folder_name
+        group_dir = grouped_dir / folder_name
         group_dir.mkdir(parents=True, exist_ok=True)
         created_group_dirs.append(group_dir)
 
@@ -313,6 +332,7 @@ def run_grouping_and_comparison(limit: int, name_threshold: float, code_threshol
 
     lock_rules_in_ledger(rule_to_folder_map, current_db_user, logger)
 
+    # Wrote rule metadata to 'temp-data/rule_info.csv'
     rule_info_path = temp_dir / "rule_info.csv"
     with open(rule_info_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -334,11 +354,14 @@ def run_grouping_and_comparison(limit: int, name_threshold: float, code_threshol
             if struct1 == struct2:
                 result, score = ("Identical", 1.0)
             else:
-                score = round(SequenceMatcher(None, struct1, struct2).ratio(), 3)
+                raw_score = SequenceMatcher(None, struct1, struct2).ratio()
+                # Cap non-identical scores at 0.999 so slight variations never print as 1.000
+                score = round(min(raw_score, 0.999), 3)
                 result = "Similar" if score >= code_threshold else "Different"
 
             comparison_rows.append([group_dir.name, file1.name, file2.name, result, score, ""])
 
+    # Wrote comparison results to 'temp-data/comparison_report.csv'
     comparison_report_path = temp_dir / "comparison_report.csv"
     with open(comparison_report_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)

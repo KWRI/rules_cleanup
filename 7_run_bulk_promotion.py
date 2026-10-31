@@ -5,11 +5,13 @@ Promotes newly standardized rules, schema maps, and metadata to the Production e
 1. Reads target numeric MLS IDs directly from 'temp-data/promotion_sources.txt' (or auto-builds it).
 2. Generates a formatted Slack promotion notification message and copies it to the clipboard.
 3. Prompts the operator for explicit Y/N confirmation before proceeding to production updates.
-4. Stages the manifest file on the remote deployment server over SFTP using a user-specific filename.
-5. Invokes an interactive SSH shell to execute remote promotion commands ('s_p',
-   'set_promotion stage prod', and 'promote_source.py').
+4. Stages the manifest file on the remote deployment server over SFTP using a user-isolated filename.
+5. Invokes an interactive SSH shell to execute remote promotion commands:
+   - s_p
+   - set_promotion stage prod
+   - promote_source.py (sanitized via tr -d '\\r')
 
-Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
+Logs execution events to console and 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
@@ -26,7 +28,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import serialization
 
-
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig=None, frame=None):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
@@ -39,7 +40,7 @@ if hasattr(signal, "SIGBREAK"):
 
 warnings.filterwarnings("ignore")
 
-if not hasattr(paramiko, 'DSSKey'):
+if not hasattr(paramiko, "DSSKey"):
     paramiko.DSSKey = paramiko.PKey
 
 current_dir = Path(__file__).resolve().parent
@@ -47,7 +48,8 @@ load_dotenv(dotenv_path=current_dir / ".env")
 
 
 def setup_logger():
-    log_dir = Path("logs")
+    """Initializes console and rotating daily file logger."""
+    log_dir = current_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     today_str = datetime.now().strftime("%Y-%m-%d")
     log_file = log_dir / f"pipeline_{today_str}.log"
@@ -70,37 +72,31 @@ def setup_logger():
 
 logger = setup_logger()
 
-# ============================================================
 # SSH ENVIRONMENT CONSTANTS
-# ============================================================
 SSH_HOST = (os.getenv("REMOTE_SSH_HOST") or os.getenv("REMOTE_HOST", "sdh.data.kw.com")).strip("'\"")
 SSH_USER = (os.getenv("REMOTE_SSH_USER") or os.getenv("SSH_USER", "")).strip("'\"")
 SSH_KEY_PATH = (os.getenv("REMOTE_SSH_KEY_PATH") or os.getenv("SSH_KEY_PATH", "")).strip("'\"")
 SSH_PASSPHRASE = (os.getenv("REMOTE_SSH_KEY_PASSPHRASE") or os.getenv("SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
-# User-specific remote manifest path to prevent permission collisions on shared infrastructure
 REMOTE_MANIFEST_PATH = os.getenv(
     "REMOTE_MANIFEST_PATH",
-    f"/eim-mls-admin-ms/devtools/source_promotion/promotion_sources_{SSH_USER}.txt" if SSH_USER else "/eim-mls-admin-ms/devtools/source_promotion/promotion_sources.txt"
+    f"/eim-mls-admin-ms/devtools/source_promotion/promotion_sources_{SSH_USER}.txt"
+    if SSH_USER
+    else "/eim-mls-admin-ms/devtools/source_promotion/promotion_sources.txt",
 )
 
 
 def ensure_promotion_manifest(temp_data_dir: Path) -> Path:
-    """
-    Ensures promotion_sources.txt exists and contains target MLS IDs.
-    If missing or empty, builds it automatically from raw_targeted_rules.csv or batch_mls_targets.csv.
-    """
+    """Ensures promotion_sources.txt exists and contains target MLS IDs."""
     manifest_path = temp_data_dir / "promotion_sources.txt"
     target_ids = set()
 
-    # 1. Read existing manifest if present
     if manifest_path.exists():
         for line in manifest_path.read_text(encoding="utf-8").splitlines():
             cleaned = line.strip().strip("'\"")
             if cleaned.isdigit():
                 target_ids.add(int(cleaned))
 
-    # 2. Fallback: Parse raw_targeted_rules.csv
     if not target_ids:
         raw_targeted_csv = temp_data_dir / "raw_targeted_rules.csv"
         if raw_targeted_csv.exists():
@@ -111,14 +107,10 @@ def ensure_promotion_manifest(temp_data_dir: Path) -> Path:
                     if mls_id.isdigit():
                         target_ids.add(int(mls_id))
 
-    # Output verified sorted manifest
     if target_ids:
         sorted_ids = sorted(list(target_ids))
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(
-            "\n".join(str(m) for m in sorted_ids) + "\n",
-            encoding="utf-8"
-        )
+        manifest_path.write_text("\n".join(str(m) for m in sorted_ids) + "\n", encoding="utf-8")
         logger.info(f"✅ Promotion manifest validated with {len(sorted_ids)} target MLS ID(s): {sorted_ids}")
 
     return manifest_path
@@ -167,18 +159,14 @@ def main() -> None:
 
     logger.info(f"🎯 [PROMOTION BATCH GUARD] Target MLS IDs loaded from manifest ({len(mls_ids)}): {mls_ids}")
 
-    # ------------------------------------------------------------
-    # 1. DRAFT SLACK NOTIFICATION & COPY TO CLIPBOARD
-    # ------------------------------------------------------------
+    # 1. Generate Slack message
     try:
         from draft_slack_message import draft_slack_message
         draft_slack_message()
     except Exception as err:
         logger.warning(f"⚠️ Slack draft generator skipped: {err}")
 
-    # ------------------------------------------------------------
-    # INTERACTIVE SAFETY GATE: CONFIRM BEFORE PROCEEDING
-    # ------------------------------------------------------------
+    # 2. Interactive prompt
     confirmation = prompt_user_confirmation(
         f"Slack message drafted and copied to clipboard for {len(mls_ids)} MLS feed(s).\n"
         f"   Are you ready to proceed with LIVE PRODUCTION PROMOTION on {SSH_HOST}?"
@@ -188,9 +176,7 @@ def main() -> None:
         logger.warning("Pipeline aborted by user prior to remote Production promotion.")
         sys.exit(0)
 
-    # ------------------------------------------------------------
-    # 2. SFTP MANIFEST STAGING
-    # ------------------------------------------------------------
+    # 3. SFTP Staging
     logger.info("============================================================")
     logger.info("📦 STAGING PROMOTION MANIFEST ON REMOTE DEPLOYMENT SERVER")
     logger.info("============================================================")
@@ -201,7 +187,6 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        # Load OpenSSH / PEM key dynamically using cryptography
         with open(SSH_KEY_PATH, "rb") as key_file:
             private_key = serialization.load_pem_private_key(
                 key_file.read(),
@@ -232,14 +217,11 @@ def main() -> None:
         for source_id in remote_sources:
             logger.info(f"   Targeted MLS ID: {source_id}")
 
-        # ------------------------------------------------------------
-        # 3. INTERACTIVE SHELL PROMOTION SEQUENCE
-        # ------------------------------------------------------------
+        # 4. Interactive Shell Promotion
         logger.info("[4/4] Invoking production rule migration engine sequentially...")
         shell = ssh.invoke_shell()
         time.sleep(2)
 
-        # Environment setup commands
         init_commands = ["s_p", "set_promotion stage prod"]
         for cmd in init_commands:
             logger.info(f"[INPUT] Sending setup command: {cmd}")
@@ -251,12 +233,10 @@ def main() -> None:
                     if line.strip():
                         logger.info(f"[REMOTE SHELL] {line}")
 
-        # Send execution loop using remote user manifest path
         loop_cmd = f'tr -d "\\r" < {REMOTE_MANIFEST_PATH} | while IFS= read -r i; do [ -n "$i" ] && echo "Processing ID: "$i && python promote_source.py -s process "$i" -y; done'
         logger.info(f"[INPUT] Sending batch promotion loop: {loop_cmd}")
         shell.send(loop_cmd + "\n")
 
-        # Dynamic output listener: continuously polls output until execution finishes completely
         logger.info("--- PRODUCTION SHELL INTERACTION OUTPUT LOGS ---")
         idle_count = 0
         while True:
@@ -269,7 +249,6 @@ def main() -> None:
             else:
                 time.sleep(2)
                 idle_count += 1
-                # Wait for 12 seconds of total remote shell silence before considering execution complete
                 if idle_count >= 6:
                     break
 

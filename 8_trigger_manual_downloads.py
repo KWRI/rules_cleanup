@@ -1,15 +1,14 @@
 """
-Pipeline Stage 8: Multi-Protocol Ingestion Job Enabler & Trigger Engine (Parallelized & Robust).
+Pipeline Stage 8: Multi-Protocol Ingestion Job Enabler & Download Trigger Engine.
 
 Parses target batch files ('temp-data/batch_mls_targets_rets.csv', 'temp-data/batch_mls_targets_api.csv',
-or 'temp-data/batch_mls_targets.csv') and triggers ingestion downloads in parallel:
-- RETS Integration: Enables Jenkins jobs, triggers 'buildWithParameters' (LOAD_TYPE=incr),
-                      and polls execution status until completion concurrently.
-- API Integration: Triggers 3-day manual reprocess downloads via Production/Stage Microservice API,
-                     captures batch IDs as strict strings, and logs details to
-                     'temp-data/triggered_downloads_log_api.csv'.
+or 'temp-data/batch_mls_targets.csv') and triggers post-promotion verification downloads in parallel:
+- RETS Feeds: Enables Jenkins jobs, triggers 'buildWithParameters' (LOAD_TYPE=incr),
+  and polls execution status until completion concurrently.
+- API Feeds: Triggers 3-day manual reprocess downloads via Microservice API,
+  captures batch IDs as strict strings, and logs details to 'temp-data/triggered_downloads_log_api.csv'.
 
-Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
+Logs execution events to console and 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
@@ -28,7 +27,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from dotenv import load_dotenv
 
-
 # --- OS-LEVEL INSTANT TERMINAL EXIT ---
 def force_terminal_exit(sig=None, frame=None):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
@@ -46,7 +44,8 @@ load_dotenv(dotenv_path=current_dir / ".env")
 
 
 def setup_logger():
-    log_dir = Path("logs")
+    """Initializes console and rotating daily file logger."""
+    log_dir = current_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     today_str = datetime.now().strftime("%Y-%m-%d")
     log_file = log_dir / f"pipeline_{today_str}.log"
@@ -69,35 +68,28 @@ def setup_logger():
 
 logger = setup_logger()
 
-# ==============================================================================
-# ENVIRONMENT CONSTANTS
-# ==============================================================================
 # Jenkins Config (RETS)
 JENKINS_URL = (os.getenv("JENKINS_PROD_URL") or os.getenv("JENKINS_STAGE_URL", "")).strip().strip("'\"")
 JENKINS_USER = (os.getenv("JENKINS_USER", "")).strip().strip("'\"")
 JENKINS_TOKEN = (os.getenv("JENKINS_PROD_TOKEN") or os.getenv("JENKINS_STAGE_TOKEN", "")).strip().strip("'\"")
 
 # API Microservice Config (API)
-MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip(
-    "'\"").rstrip("/")
-PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[
-    0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
+MLS_ADMIN_PROD_URL = (os.getenv("MLS_ADMIN_PROD_URL") or os.getenv("MLS_ADMIN_STAGE_URL", "")).strip().strip("'\"").rstrip("/")
+PROD_BASE_URL = (
+    MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0]
+    if "/v1/mls-admin" in MLS_ADMIN_PROD_URL
+    else MLS_ADMIN_PROD_URL
+)
 
 API_KEY = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
 
-# Jenkins Polling Config
 POLL_INTERVAL_SEC = 15
 MAX_WAIT_MINUTES = 10
 MAX_PARALLEL_WORKERS = 8
 
-# API Download Defaults
 DEFAULT_RELATIVE_PERIOD = "3"
 DEFAULT_RELATIVE_PERIOD_UNIT = "day"
 
-
-# ==============================================================================
-# ROBUST NETWORK SESSION BUILDER
-# ==============================================================================
 
 def create_robust_session() -> requests.Session:
     """Creates a requests session configured with automatic retries for dropped connections."""
@@ -106,17 +98,13 @@ def create_robust_session() -> requests.Session:
         total=3,
         backoff_factor=2,
         status_forcelist=[500, 502, 503, 504],
-        raise_on_status=False
+        raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
-
-# ==============================================================================
-# CODE BLOCK 1: RETS INGESTION TRIGGER & MONITORING (JENKINS)
-# ==============================================================================
 
 def get_jenkins_crumb(session: requests.Session) -> dict:
     """Fetches a CSRF Crumb header if required by Jenkins."""
@@ -131,12 +119,10 @@ def get_jenkins_crumb(session: requests.Session) -> dict:
     return {}
 
 
-def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, headers: dict,
-                                    load_type: str = "incr") -> bool:
-    """Enables, triggers, and polls a Jenkins job until completion (Thread Worker)."""
+def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, headers: dict, load_type: str = "incr") -> bool:
+    """Enables, triggers, and polls a Jenkins job until completion."""
     base_url = JENKINS_URL.rstrip("/")
 
-    # 1. Enable Job
     try:
         enable_url = f"{base_url}/job/{job_name}/enable"
         session.post(enable_url, headers=headers, timeout=15)
@@ -144,7 +130,6 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
     except Exception as e:
         logger.warning(f"⚠️ Could not verify enabled status for '{job_name}': {e}")
 
-    # 2. Trigger Parameterized Build
     build_url = f"{base_url}/job/{job_name}/buildWithParameters"
     try:
         response = session.post(build_url, headers=headers, params={"LOAD_TYPE": load_type}, timeout=15)
@@ -156,7 +141,6 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
         logger.error(f"❌ Network failure while triggering '{job_name}': {e}")
         return False
 
-    # 3. Resolve Queue Item to get Build Number
     queue_url = response.headers.get("Location")
     build_number = None
 
@@ -175,7 +159,6 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
                 logger.warning(f"⚠️ Connection glitch polling queue for '{job_name}' (retrying): {err}")
 
-    # Fallback: query job API directly if queue resolution timed out
     if not build_number:
         try:
             last_build_res = session.get(f"{base_url}/job/{job_name}/api/json", timeout=10)
@@ -191,7 +174,6 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
     console_url = f"{base_url}/job/{job_name}/{build_number}/console"
     logger.info(f"📌 Build #{build_number} active for '{job_name}'. Live logs: {console_url}")
 
-    # 4. Asynchronous Polling Loop
     start_time = time.time()
     max_wait_seconds = MAX_WAIT_MINUTES * 60
 
@@ -214,8 +196,7 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
                 elapsed = int(time.time() - start_time)
                 logger.info(f"⏳ Build #{build_number} ('{job_name}') in progress... (Elapsed: {elapsed}s)")
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
-            logger.warning(
-                f"⚠️ Network blip polling status for '{job_name}': {err}. Retrying in {POLL_INTERVAL_SEC}s...")
+            logger.warning(f"⚠️ Network blip polling status for '{job_name}': {err}. Retrying in {POLL_INTERVAL_SEC}s...")
 
         time.sleep(POLL_INTERVAL_SEC)
 
@@ -230,7 +211,7 @@ def process_rets_triggers_parallel(rets_targets: set):
     logger.info("------------------------------------------------------------")
 
     if not JENKINS_URL or not JENKINS_TOKEN:
-        logger.error("❌ Missing JENKINS_PROD_URL / JENKINS_STAGE_URL or JENKINS_TOKEN in environment configuration.")
+        logger.error("❌ Missing JENKINS_PROD_URL / JENKINS_STAGE_URL or JENKINS_TOKEN in configuration.")
         return
 
     session = create_robust_session()
@@ -280,13 +261,9 @@ def process_rets_triggers_parallel(rets_targets: set):
     logger.info(f"✅ RETS Builds Complete | Successful: {success_count} | Failed: {failure_count}")
 
 
-# ==============================================================================
-# CODE BLOCK 2: API INGESTION MANUAL DOWNLOAD TRIGGER ENGINE
-# ==============================================================================
-
 def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str, content_type: str,
                          content_sub_type: str, max_retries: int = 4) -> dict | None:
-    """Triggers 3-day download for an API target with strict string batch ID casting and backoff retry logic."""
+    """Triggers 3-day download for an API target with strict string batch ID casting."""
     url = f"{PROD_BASE_URL}/v1/listing-mflow/reprocess/download/mls/{mls_id}"
 
     headers = {
@@ -306,9 +283,7 @@ def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str
         "force": "true",
     }
 
-    logger.info(
-        f"🚀 Triggering 3-Day Download | MLS: {mls_id} ({mls_id_str}) | [{content_type} / {content_sub_type}]"
-    )
+    logger.info(f"🚀 Triggering 3-Day Download | MLS: {mls_id} ({mls_id_str}) | [{content_type} / {content_sub_type}]")
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -316,8 +291,6 @@ def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str
 
             if response.status_code in (200, 201, 202):
                 data = response.json() if response.text else {}
-
-                # FORCE STRICT STRING CASTING TO PREVENT 64-BIT INT FLOAT ROUNDING
                 raw_batch_id = data.get("batch_id")
                 batch_id = str(raw_batch_id).strip() if raw_batch_id is not None else ""
 
@@ -385,7 +358,7 @@ def save_triggered_downloads_log(batch_records: list[dict]) -> Path:
 
 
 def process_api_triggers_parallel(api_targets: list[dict]):
-    """Processes 3-day manual reprocess downloads serially per MLS ID to eliminate backend thread locks."""
+    """Processes manual reprocess downloads in parallel grouped by MLS."""
     logger.info("------------------------------------------------------------")
     logger.info(f"⚙️ [API BLOCK] Processing {len(api_targets)} target download payload(s) via API Service...")
     logger.info("------------------------------------------------------------")
@@ -408,22 +381,13 @@ def process_api_triggers_parallel(api_targets: list[dict]):
         for idx, t in enumerate(targets_list):
             if idx > 0:
                 time.sleep(1.5)
-            res = trigger_api_download(
-                session,
-                t["mls_id"],
-                t["mls_id_str"],
-                t["content_type"],
-                t["content_sub_type"]
-            )
+            res = trigger_api_download(session, t["mls_id"], t["mls_id_str"], t["content_type"], t["content_sub_type"])
             if res:
                 group_records.append(res)
         return group_records
 
     with ThreadPoolExecutor(max_workers=min(len(grouped_by_mls), MAX_PARALLEL_WORKERS)) as executor:
-        future_to_mls = {
-            executor.submit(process_mls_group, targets): mls_id
-            for mls_id, targets in grouped_by_mls.items()
-        }
+        future_to_mls = {executor.submit(process_mls_group, targets): mls_id for mls_id, targets in grouped_by_mls.items()}
 
         for future in as_completed(future_to_mls):
             mls_id = future_to_mls[future]
@@ -433,7 +397,7 @@ def process_api_triggers_parallel(api_targets: list[dict]):
                     triggered_records.extend(recs)
                     total_triggered += len(recs)
                 expected_count = len(grouped_by_mls[mls_id])
-                total_failed += (expected_count - len(recs))
+                total_failed += expected_count - len(recs)
             except Exception as exc:
                 logger.error(f"❌ Exception in group execution for MLS '{mls_id}': {exc}")
                 total_failed += len(grouped_by_mls[mls_id])
@@ -441,10 +405,6 @@ def process_api_triggers_parallel(api_targets: list[dict]):
     save_triggered_downloads_log(triggered_records)
     logger.info(f"✅ API Triggers Complete | Successful: {total_triggered} | Failed: {total_failed}")
 
-
-# ==============================================================================
-# MAIN ROUTING ENGINE
-# ==============================================================================
 
 def main():
     logger.info("============================================================")

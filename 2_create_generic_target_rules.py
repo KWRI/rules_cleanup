@@ -1,17 +1,20 @@
 """
-Pre-processes identical rule clusters by deriving generic target rule names.
-Implements multi-tier candidate scoring:
-  1. Priority 1: Already standardized generic rule (PascalCase / Phase 2)
-  2. Priority 2: Most recently maintained rule (latest updated_at)
-  3. Priority 3: Fallback to oldest created_at
+Pipeline Stage 2: Generic Target Rule Name Resolver & Creator.
 
-Performs CASE-INSENSITIVE DB checks and 100% AST logic identity verification.
-Detects soft-deleted Stage DB rules and forces a versioned suffix (e.g., V1, V2)
-to avoid API 404 lookup crashes during downstream promotion.
+Analyzes identical rule clusters from Stage 1 to resolve or register standardized generic rules:
+1. Reads candidate rule clusters from 'temp-data/comparison_report.csv'.
+2. Evaluates candidate scoring:
+   - Priority 1: Already standardized generic rule (PascalCase / non-numeric MLS prefix).
+   - Priority 2: Most recently maintained rule (latest updated_at).
+   - Priority 3: Fallback to earliest created_at.
+3. Performs case-insensitive database checks and strict AST logic verification.
+4. Detects soft-deleted Stage DB rules and safely increments version suffixes (V1, V2...)
+   to prevent downstream API conflicts.
+5. Modes:
+   - Preview Mode (Default): Generates 'temp-data/resolved_generic_targets.csv' (no DB mutation).
+   - Creation Mode (--do-creation): Registers new generic rules via Microservice API.
 
-Modes:
-  python 2_create_generic_target_rules.py               # DEFAULT: Preview mode (Generates CSV preview ONLY)
-  python 2_create_generic_target_rules.py --do-creation # EXECUTE: Creates new rules via API from reviewed CSV
+Logs execution events to console and 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
@@ -35,6 +38,7 @@ def force_terminal_exit(sig=None, frame=None):
     print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
     os._exit(1)
 
+
 signal.signal(signal.SIGINT, force_terminal_exit)
 if hasattr(signal, "SIGBREAK"):
     signal.signal(signal.SIGBREAK, force_terminal_exit)
@@ -47,42 +51,89 @@ from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.hazmat.primitives import serialization
 
-if not hasattr(paramiko, 'DSSKey'):
+if not hasattr(paramiko, "DSSKey"):
     paramiko.DSSKey = paramiko.PKey
+
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
 
 
 def setup_logger():
+    """Initializes console and rotating daily file logger."""
+    log_dir = current_dir / "logs"
+    log_dir.mkdir(exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = log_dir / f"pipeline_{today_str}.log"
+
     logger = logging.getLogger("GenericTargetRuleResolver")
     logger.setLevel(logging.INFO)
     if not logger.hasHandlers():
         formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+
+        c_handler = logging.StreamHandler(sys.stdout)
+        c_handler.setFormatter(formatter)
+        logger.addHandler(c_handler)
+
+        f_handler = logging.FileHandler(log_file, encoding="utf-8")
+        f_handler.setFormatter(formatter)
+        logger.addHandler(f_handler)
+
     return logger
 
 
-class SkeletonMapper(ast.NodeTransformer):
-    def visit_Name(self, n): return ast.copy_location(ast.Name('v', n.ctx), n)
-    def visit_Constant(self, n): return ast.copy_location(ast.Constant('c'), n)
-    def visit_FunctionDef(self, n): n.name = 'f'; self.generic_visit(n); return n
-    def visit_AsyncFunctionDef(self, n): n.name = 'f'; self.generic_visit(n); return n
+class StrictRuleNormalizer(ast.NodeTransformer):
+    """
+    Strips module, function, and async function docstrings so documentation/formatting
+    differences do not break comparisons. Retains 100% of executable Python statements,
+    constants, dictionary structures, and variable names.
+    """
+
+    def visit_Module(self, node):
+        if (
+            node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        ):
+            node.body.pop(0)
+        self.generic_visit(node)
+        return node
+
+    def visit_FunctionDef(self, node):
+        if (
+            node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        ):
+            node.body.pop(0)
+        self.generic_visit(node)
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        if (
+            node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        ):
+            node.body.pop(0)
+        self.generic_visit(node)
+        return node
 
 
 def get_normalized_structure(source: str):
+    """Parses Python source, removes docstrings via AST, and unparses into whitespace-stripped code."""
     try:
         tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
-                    and node.body and isinstance(node.body[0], ast.Expr) \
-                    and isinstance(node.body[0].value, ast.Constant):
-                node.body.pop(0)
-        return "".join(ast.unparse(SkeletonMapper().visit(tree)).split())
+        transformed = StrictRuleNormalizer().visit(tree)
+        return "".join(ast.unparse(transformed).split())
     except (SyntaxError, TypeError):
         return None
 
 
 def are_ast_structures_identical(source1: str, source2: str) -> bool:
+    """Verifies whether two Python rule source strings have identical AST logic."""
     if not source1 or not source2:
         return False
     s1 = get_normalized_structure(source1)
@@ -101,6 +152,7 @@ def is_already_standardized_generic(name: str) -> bool:
 
 
 def to_pascal_case(name: str) -> str:
+    """Converts raw rule name into clean PascalCase."""
     base_name = name.removesuffix(".py")
     base_name = re.sub(r"[\(\)\[\]\{\}]", "", base_name)
     base_name = re.sub(r"[/|\\]|__", " ", base_name)
@@ -120,16 +172,18 @@ def to_pascal_case(name: str) -> str:
                 word = word[:idx] + word[idx].upper() + word[idx + 1:]
             pascal_words.append(word)
     pascal = "".join(pascal_words)
-    return pascal if pascal else 'UnnamedRule'
+    return pascal if pascal else "UnnamedRule"
 
 
 def strip_numeric_prefix(name: str) -> str:
+    """Strips leading numeric MLS identifiers and formats remaining name to PascalCase."""
     base = name.removesuffix(".py")
     cleaned = re.sub(r"^\d+", "", base)
     return to_pascal_case(cleaned if cleaned else base)
 
 
 def load_ssh_pkey(key_path: str, passphrase: str):
+    """Loads private RSA key from filesystem for SSH authentication."""
     with open(key_path, "rb") as key_file:
         private_key = serialization.load_pem_private_key(
             key_file.read(),
@@ -144,7 +198,8 @@ def load_ssh_pkey(key_path: str, passphrase: str):
 
 
 def get_db_connection_params():
-    load_dotenv()
+    """Extracts database and SSH connection parameters from environment."""
+    load_dotenv(dotenv_path=current_dir / ".env")
     ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
     ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
     ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
@@ -152,22 +207,33 @@ def get_db_connection_params():
 
     db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
     db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
-    db_user = (os.getenv("DB_USER", "")).strip("'\"")
+    db_user = (os.getenv("DB_USER") or os.getenv("USERNAME") or "migration_pipeline_bot").strip("'\"")
     db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
     return ssh_host, ssh_user, ssh_key_path, ssh_passphrase, db_host, db_name, db_user, db_pass
 
 
 def get_existing_db_rules_with_metadata(logger: logging.Logger) -> tuple[dict, set]:
+    """Queries all active and soft-deleted process rules from Staging DB."""
     ssh_host, ssh_user, ssh_key_path, ssh_passphrase, db_host, db_name, db_user, db_pass = get_db_connection_params()
     existing_rules = {}
     deleted_rules_lower = set()
+
     try:
         pkey = load_ssh_pkey(ssh_key_path, ssh_passphrase)
         logger.info("Connecting to DB to query existing active and soft-deleted rules...")
-        with SSHTunnelForwarder((ssh_host, 22), ssh_username=ssh_user, ssh_pkey=pkey,
-                                remote_bind_address=(db_host, 5432)) as tunnel:
-            with psycopg2.connect(dbname=db_name, user=db_user, password=db_pass, host="127.0.0.1",
-                                  port=tunnel.local_bind_port) as conn:
+        with SSHTunnelForwarder(
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=pkey,
+            remote_bind_address=(db_host, 5432),
+        ) as tunnel:
+            with psycopg2.connect(
+                dbname=db_name,
+                user=db_user,
+                password=db_pass,
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
+            ) as conn:
                 with conn.cursor() as cur:
                     query = """
                         SELECT name, content, COALESCE(updated_at, created_at) AS updated_at, created_at, deleted_at 
@@ -181,11 +247,13 @@ def get_existing_db_rules_with_metadata(logger: logging.Logger) -> tuple[dict, s
                         else:
                             existing_rules[r_name_lower] = (r_name, r_content or "", r_updated, r_created)
     except Exception as e:
-        logger.error(f"Database error while fetching existing rules: {e}", exc_info=True)
+        logger.error(f"❌ Database error while fetching existing rules: {e}", exc_info=True)
+
     return existing_rules, deleted_rules_lower
 
 
 def select_best_candidate_rule(rules: set, existing_rules_lower: dict) -> tuple[str, str]:
+    """Selects the best surviving candidate rule based on generic standardization and recency scoring."""
     scored_candidates = []
 
     for rule_name in rules:
@@ -204,7 +272,7 @@ def select_best_candidate_rule(rules: set, existing_rules_lower: dict) -> tuple[
         score = (
             1 if is_std else 0,
             updated_at,
-            -created_ts
+            -created_ts,
         )
 
         reason = "ALREADY_GENERIC" if is_std else "MOST_RECENTLY_UPDATED"
@@ -217,13 +285,14 @@ def select_best_candidate_rule(rules: set, existing_rules_lower: dict) -> tuple[
 
 def register_generic_rule_via_microservice(source_rule_name: str, generic_target_name: str,
                                            logger: logging.Logger) -> bool:
-    load_dotenv()
-    api_key = os.getenv("MLS_ADMIN_API_KEY", "").strip().strip("'\"")
-    stage_url = os.getenv("MLS_ADMIN_STAGE_URL", "https://stage-ext-ms.data.kw.com/v1/mls-admin").strip().strip("'\"").rstrip("/")
+    """Registers a new standardized generic rule via Microservice API using source rule definition."""
+    load_dotenv(dotenv_path=current_dir / ".env")
+    api_key = (os.getenv("MLS_ADMIN_API_KEY") or os.getenv("MS_API_KEY", "")).strip().strip("'\"")
+    stage_url = (os.getenv("MLS_ADMIN_STAGE_URL") or "https://stage-ext-ms.data.kw.com/v1/mls-admin").strip().strip("'\"").rstrip("/")
     rules_endpoint = f"{stage_url}/rules"
 
     if not api_key:
-        logger.error("MLS_ADMIN_API_KEY missing from environment configuration.")
+        logger.error("❌ MLS_ADMIN_API_KEY missing from environment configuration.")
         return False
 
     ssh_host, ssh_user, ssh_key_path, ssh_passphrase, db_host, db_name, db_user, db_pass = get_db_connection_params()
@@ -231,10 +300,19 @@ def register_generic_rule_via_microservice(source_rule_name: str, generic_target
 
     try:
         pkey = load_ssh_pkey(ssh_key_path, ssh_passphrase)
-        with SSHTunnelForwarder((ssh_host, 22), ssh_username=ssh_user, ssh_pkey=pkey,
-                                remote_bind_address=(db_host, 5432)) as tunnel:
-            with psycopg2.connect(dbname=db_name, user=db_user, password=db_pass, host="127.0.0.1",
-                                  port=tunnel.local_bind_port) as conn:
+        with SSHTunnelForwarder(
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=pkey,
+            remote_bind_address=(db_host, 5432),
+        ) as tunnel:
+            with psycopg2.connect(
+                dbname=db_name,
+                user=db_user,
+                password=db_pass,
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
+            ) as conn:
                 with conn.cursor() as cur:
                     select_query = """
                         SELECT pr.content, pr.description, rl.name as language_name, rg.name as group_name
@@ -248,7 +326,7 @@ def register_generic_rule_via_microservice(source_rule_name: str, generic_target
                     source_record = cur.fetchone()
 
                     if not source_record:
-                        logger.error(f"Source rule '{source_rule_name}' not found in DB.")
+                        logger.error(f"❌ Source rule '{source_rule_name}' not found in DB.")
                         return False
 
                     content, description, lang_name, group_name = source_record
@@ -277,14 +355,15 @@ def register_generic_rule_via_microservice(source_rule_name: str, generic_target
                             time.sleep(attempt * 2)
                             continue
                         else:
-                            logger.error(f"Failed to create '{generic_target_name}' [{res.status_code}]: {res.text}")
+                            logger.error(f"❌ Failed to create '{generic_target_name}' [{res.status_code}]: {res.text}")
                             return False
     except Exception as e:
-        logger.error(f"Error creating generic rule '{generic_target_name}': {e}", exc_info=True)
+        logger.error(f"❌ Error creating generic rule '{generic_target_name}': {e}", exc_info=True)
         return False
 
 
 def resolve_generic_targets(do_creation: bool = False):
+    """Main resolver engine: generates preview mapping or executes API rule creation."""
     logger = setup_logger()
     logger.info("============================================================")
     if do_creation:
@@ -293,7 +372,8 @@ def resolve_generic_targets(do_creation: bool = False):
         logger.info("🔍 STAGE 2: PREVIEW MODE (GENERATING PREVIEW CSV - NO DB MUTATION)")
     logger.info("============================================================")
 
-    temp_dir = Path("temp-data")
+    temp_dir = current_dir / "temp-data"
+    grouped_dir = temp_dir / "grouped"
     comparison_report_path = temp_dir / "comparison_report.csv"
     out_csv = temp_dir / "resolved_generic_targets.csv"
 
@@ -304,7 +384,7 @@ def resolve_generic_targets(do_creation: bool = False):
             return
 
         created_count = 0
-        with open(out_csv, 'r', encoding='utf-8') as f:
+        with open(out_csv, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 action = row.get("action", "")
@@ -321,19 +401,19 @@ def resolve_generic_targets(do_creation: bool = False):
 
     # --- PREVIEW MODE: Generate resolved_generic_targets.csv WITHOUT API Calls ---
     if not comparison_report_path.exists():
-        logger.error(f"Missing {comparison_report_path}. Run 1_group_similar_rules.py first.")
+        logger.error(f"❌ Missing {comparison_report_path}. Run 1_group_similar_rules.py first.")
         return
 
     identical_groups = defaultdict(set)
-    with open(comparison_report_path, 'r', encoding='utf-8') as f:
+    with open(comparison_report_path, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            if row['comparison_result'] == 'Identical':
-                rule1 = row['file1'].removesuffix(".py")
-                rule2 = row['file2'].removesuffix(".py")
-                identical_groups[row['group_folder']].update([rule1, rule2])
+            if row["comparison_result"] == "Identical":
+                rule1 = row["file1"].removesuffix(".py")
+                rule2 = row["file2"].removesuffix(".py")
+                identical_groups[row["group_folder"]].update([rule1, rule2])
 
     if not identical_groups:
-        logger.info("No 'Identical' rule clusters found in comparison report.")
+        logger.info("ℹ️ No 'Identical' rule clusters found in comparison report.")
         return
 
     existing_rules_lower, deleted_rules_lower = get_existing_db_rules_with_metadata(logger)
@@ -342,7 +422,7 @@ def resolve_generic_targets(do_creation: bool = False):
     for group_folder, rules in identical_groups.items():
         selected_candidate, selection_reason = select_best_candidate_rule(rules, existing_rules_lower)
 
-        candidate_file_path = temp_dir / group_folder / f"{selected_candidate}.py"
+        candidate_file_path = grouped_dir / group_folder / f"{selected_candidate}.py"
         if candidate_file_path.exists():
             candidate_code = candidate_file_path.read_text(encoding="utf-8")
         else:
@@ -352,7 +432,7 @@ def resolve_generic_targets(do_creation: bool = False):
         target_name = base_generic_name
         action = "REUSE_EXISTING"
 
-        # --- CHECK IF PROPOSED TARGET NAME IS SOFT-DELETED IN STAGE DB ---
+        # Check if proposed target name is soft-deleted in Stage DB
         if target_name.lower() in deleted_rules_lower:
             version = 1
             versioned_target = f"{base_generic_name}V{version}"
@@ -404,7 +484,7 @@ def resolve_generic_targets(do_creation: bool = False):
 
         resolved_mapping[group_folder] = (target_name, selected_candidate, selection_reason, action)
 
-    with open(out_csv, 'w', newline='', encoding='utf-8') as f:
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["group_folder", "resolved_generic_target", "source_candidate", "selection_reason", "action"])
         for group_folder, (generic_target, src_cand, reason, act) in resolved_mapping.items():
